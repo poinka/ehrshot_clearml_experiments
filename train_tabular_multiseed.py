@@ -237,6 +237,8 @@ def maybe_init_clearml(args, config: dict):
 
     from clearml import Task
 
+    Task.force_requirements_env_freeze(False, "requirements.txt")
+    
     task = Task.init(
         project_name=args.clearml_project,
         task_name=args.clearml_task_name,
