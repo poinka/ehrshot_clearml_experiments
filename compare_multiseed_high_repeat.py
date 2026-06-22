@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import os
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -148,28 +150,137 @@ PAIRWISE_COMPARISONS = [
     },
 ]
 
+def is_clearml_agent_run() -> bool:
+    return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("TRAINS_TASK_ID"))
+
+
+def build_clearml_config(args) -> dict:
+    config = vars(args).copy()
+
+    for key in [
+        "tabular_predictions",
+        "sequence_predictions",
+        "numeric_predictions",
+        "audit_dir",
+        "output_dir",
+    ]:
+        if key in config:
+            config[key] = str(config[key])
+
+    return config
+
+
+def sync_args_from_clearml_config(args, config: dict) -> None:
+    path_keys = {
+        "tabular_predictions",
+        "sequence_predictions",
+        "numeric_predictions",
+        "audit_dir",
+        "output_dir",
+    }
+    int_keys = {"bootstrap", "seed"}
+    skip_keys = {"enable_clearml", "execute_remotely"}
+
+    for key, value in config.items():
+        if key in skip_keys:
+            continue
+        if not hasattr(args, key):
+            continue
+
+        if key in path_keys:
+            setattr(args, key, Path(value))
+        elif key in int_keys:
+            setattr(args, key, int(value))
+        else:
+            setattr(args, key, value)
+
+
 def maybe_init_clearml(args, config: dict):
-    if not args.enable_clearml:
-        return None
+    remote_agent_run = is_clearml_agent_run()
+
+    if not args.enable_clearml and not remote_agent_run:
+        return None, config
 
     from clearml import Task
 
-    task = Task.init(
-        project_name=args.clearml_project,
-        task_name=args.clearml_task_name,
-        output_uri=args.clearml_output_uri or None,
-    )
+    if not remote_agent_run:
+        Task.force_requirements_env_freeze(False, "requirements.txt")
 
-    task.connect(config)
+    should_execute_remotely = args.execute_remotely and not remote_agent_run
 
-    if args.execute_remotely:
+    if remote_agent_run:
+        task = Task.current_task()
+        if task is None:
+            task = Task.init(
+                project_name=args.clearml_project,
+                task_name=args.clearml_task_name,
+                output_uri=args.clearml_output_uri or None,
+                auto_connect_arg_parser=False,
+            )
+    else:
+        task = Task.init(
+            project_name=args.clearml_project,
+            task_name=args.clearml_task_name,
+            output_uri=args.clearml_output_uri or None,
+            auto_connect_arg_parser=False,
+        )
+
+    connected_config = task.connect(config)
+    connected_config = dict(connected_config)
+    sync_args_from_clearml_config(args, connected_config)
+
+    print("Resolved ClearML parameters:")
+    print(f"  remote_agent_run = {remote_agent_run}")
+    print(f"  tabular_task_id = {args.tabular_task_id}")
+    print(f"  sequence_task_id = {args.sequence_task_id}")
+    print(f"  numeric_task_id = {args.numeric_task_id}")
+    print(f"  audit_s3_prefix = {args.audit_s3_prefix}")
+    print(f"  output_dir = {args.output_dir}")
+    print(f"  clearml_queue = {args.clearml_queue}")
+
+    if should_execute_remotely:
         print(f"Enqueueing ClearML task to queue: {args.clearml_queue}")
         task.execute_remotely(
             queue_name=args.clearml_queue,
             exit_process=True,
         )
 
-    return task
+    return task, connected_config
+
+def load_dataframe_artifact(task_id: str, artifact_name: str) -> pd.DataFrame:
+    from clearml import Task
+
+    print(f"Loading artifact '{artifact_name}' from task_id={task_id}")
+    src_task = Task.get_task(task_id=task_id)
+
+    if artifact_name not in src_task.artifacts:
+        available = list(src_task.artifacts.keys())
+        raise KeyError(
+            f"Artifact '{artifact_name}' not found in task {task_id}. "
+            f"Available artifacts: {available}"
+        )
+
+    artifact = src_task.artifacts[artifact_name]
+
+    # Если artifact был загружен как pandas DataFrame через upload_artifact(name, df),
+    # artifact.get() обычно вернет сам DataFrame.
+    obj = artifact.get()
+    if isinstance(obj, pd.DataFrame):
+        return obj
+
+    # Fallback: если вернулся путь/файл.
+    local_copy = Path(artifact.get_local_copy())
+    if local_copy.is_file():
+        return pd.read_csv(local_copy)
+
+    csv_files = sorted(local_copy.glob("*.csv")) if local_copy.is_dir() else []
+    if len(csv_files) == 1:
+        return pd.read_csv(csv_files[0])
+
+    raise ValueError(
+        f"Could not load artifact '{artifact_name}' from task {task_id}. "
+        f"get() returned type={type(obj)}, local_copy={local_copy}"
+    )
 
 def load_predictions(path: Path, family_name: str) -> pd.DataFrame:
     if path.is_dir():
@@ -191,21 +302,55 @@ def load_predictions(path: Path, family_name: str) -> pd.DataFrame:
 
 
 def load_all_predictions(args) -> pd.DataFrame:
-    parts = [
-        load_predictions(args.tabular_predictions, "tabular"),
-        load_predictions(args.sequence_predictions, "sequence"),
-        load_predictions(args.numeric_predictions, "numeric_sequence"),
-    ]
+    parts = []
+
+    if args.tabular_task_id:
+        parts.append(
+            load_dataframe_artifact(
+                args.tabular_task_id,
+                "tabular_multiseed_predictions",
+            )
+        )
+    else:
+        parts.append(load_predictions(args.tabular_predictions, "tabular"))
+
+    if args.sequence_task_id:
+        parts.append(
+            load_dataframe_artifact(
+                args.sequence_task_id,
+                "sequence_multiseed_predictions",
+            )
+        )
+    else:
+        parts.append(load_predictions(args.sequence_predictions, "sequence"))
+
+    if args.numeric_task_id:
+        parts.append(
+            load_dataframe_artifact(
+                args.numeric_task_id,
+                "numeric_sequence_multiseed_predictions",
+            )
+        )
+    else:
+        parts.append(load_predictions(args.numeric_predictions, "numeric_sequence"))
+
     df = pd.concat(parts, ignore_index=True)
-    required = {"task", "family", "source", "version", "model", "seed", "calibration", "row_id", "subject_id", "y_true", "risk"}
+
+    required = {
+        "task", "family", "source", "version", "model", "seed", "calibration",
+        "row_id", "subject_id", "y_true", "risk",
+    }
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns in predictions: {missing}")
+
     df = df[df["calibration"] == args.calibration].copy()
+
     for c in ["row_id", "subject_id", "seed", "y_true"]:
         df[c] = df[c].astype(int)
+
     df["risk"] = df["risk"].astype(float)
-    # Keep only configs needed for planned pairwise comparisons
+
     masks = []
     for cfg in PRIMARY_CONFIGS:
         m = (
@@ -215,9 +360,47 @@ def load_all_predictions(args) -> pd.DataFrame:
             & (df["model"] == cfg["model"])
         )
         masks.append(m)
+
     df = df[np.logical_or.reduce(masks)].copy()
     return df
 
+def maybe_download_audit_from_s3_prefix(audit_dir: Path, audit_s3_prefix: str) -> Path:
+    expected = [
+        audit_dir / f"task_history_copy_forwarding_audit__{task}.csv"
+        for task in TASKS
+    ]
+
+    if all(p.exists() for p in expected):
+        print(f"Using local audit dir: {audit_dir}")
+        return audit_dir
+
+    if not audit_s3_prefix:
+        missing = [str(p) for p in expected if not p.exists()]
+        raise FileNotFoundError(
+            "Audit files are missing locally and --audit-s3-prefix is not provided. "
+            f"Missing files: {missing}"
+        )
+
+    from clearml import StorageManager
+
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    prefix = audit_s3_prefix.rstrip("/")
+
+    for task in TASKS:
+        fname = f"task_history_copy_forwarding_audit__{task}.csv"
+        dst = audit_dir / fname
+
+        if dst.exists():
+            continue
+
+        remote_url = f"{prefix}/{fname}"
+        print(f"Downloading {remote_url}")
+        local_copy = Path(StorageManager.get_local_copy(remote_url=remote_url))
+
+        print(f"Copying {local_copy} -> {dst}")
+        shutil.copy2(local_copy, dst)
+
+    return audit_dir
 
 def load_high_repeat(audit_dir: Path, threshold_source: str = "held_out", q: float = 0.90):
     parts = []
@@ -403,6 +586,10 @@ def main():
     parser.add_argument("--tabular-predictions", type=Path, default=Path("ehrshot_multiseed_tabular_results/tabular_multiseed_heldout_predictions.csv"))
     parser.add_argument("--sequence-predictions", type=Path, default=Path("ehrshot_multiseed_sequence_results/sequence_multiseed_heldout_predictions.csv"))
     parser.add_argument("--numeric-predictions", type=Path, default=Path("ehrshot_multiseed_numeric_sequence_results/numeric_sequence_multiseed_heldout_predictions.csv"))
+    parser.add_argument("--tabular-task-id", type=str, default="")
+    parser.add_argument("--sequence-task-id", type=str, default="")
+    parser.add_argument("--numeric-task-id", type=str, default="")
+    parser.add_argument("--audit-s3-prefix", type=str, default="")
     parser.add_argument("--audit-dir", type=Path, default=Path("ehrshot_copy_forwarding_audit"))
     parser.add_argument("--output-dir", type=Path, default=Path("ehrshot_multiseed_all_model_comparison"))
     parser.add_argument("--calibration", type=str, default="platt")
@@ -440,12 +627,16 @@ def main():
         default="s3://api.blackhole2.ai.innopolis.university:443/pershin-medailab",
     )
     args = parser.parse_args()
+    config = build_clearml_config(args)
+    clearml_task, config = maybe_init_clearml(args, config)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    config = vars(args).copy()
-    clearml_task = maybe_init_clearml(args, config)
-
     pred = load_all_predictions(args)
+    args.audit_dir = maybe_download_audit_from_s3_prefix(
+        audit_dir=args.audit_dir,
+        audit_s3_prefix=args.audit_s3_prefix,
+    )
     audit, thresholds = load_high_repeat(args.audit_dir)
     merged = add_high_repeat(pred, audit)
 
