@@ -5,6 +5,8 @@ import json
 import math
 from copy import deepcopy
 from pathlib import Path
+import os
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -72,6 +74,62 @@ def load_vocab(data_dir: Path, task: str, version: str) -> dict:
     with open(data_dir / task / version / "vocab.json", "r", encoding="utf-8") as f:
         return json.load(f)
 
+def maybe_download_sequence_datasets_from_s3_prefix(
+    sequence_data_dir: Path,
+    sequence_data_s3_prefix: str,
+    configs: list[dict],
+) -> Path:
+    """
+    Download required sequence dataset files from MinIO/S3 if they are not available locally.
+
+    Expected remote layout:
+        <prefix>/<task>/<version>/examples.parquet
+        <prefix>/<task>/<version>/vocab.json
+    """
+    required_pairs = sorted({(cfg["task"], cfg["version"]) for cfg in configs})
+
+    expected_files = []
+    for task, version in required_pairs:
+        expected_files.append(sequence_data_dir / task / version / "examples.parquet")
+        expected_files.append(sequence_data_dir / task / version / "vocab.json")
+
+    if all(p.exists() for p in expected_files):
+        print(f"Using local sequence datasets: {sequence_data_dir}")
+        return sequence_data_dir
+
+    if not sequence_data_s3_prefix:
+        missing = [str(p) for p in expected_files if not p.exists()]
+        raise FileNotFoundError(
+            "Sequence dataset files are missing locally and --sequence-data-s3-prefix is not provided. "
+            f"Missing files: {missing[:20]}"
+        )
+
+    from clearml import StorageManager
+
+    prefix = sequence_data_s3_prefix.rstrip("/")
+
+    for task, version in required_pairs:
+        local_dir = sequence_data_dir / task / version
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        for fname in ["examples.parquet", "vocab.json"]:
+            dst = local_dir / fname
+
+            if dst.exists():
+                print(f"Already exists locally: {dst}")
+                continue
+
+            remote_url = f"{prefix}/{task}/{version}/{fname}"
+            print(f"Downloading {remote_url}")
+            local_copy = Path(StorageManager.get_local_copy(remote_url=remote_url))
+
+            if not local_copy.exists():
+                raise FileNotFoundError(f"StorageManager returned missing local file: {local_copy}")
+
+            print(f"Copying {local_copy} -> {dst}")
+            shutil.copy2(local_copy, dst)
+
+    return sequence_data_dir
 
 def compute_token_numeric_stats(df_train: pd.DataFrame, vocab_size: int, min_count: int = 3):
     count = np.zeros(vocab_size, dtype=np.float64)
@@ -403,34 +461,112 @@ def run_one(args, cfg, seed, device):
         torch.save({"task": cfg["task"], "version": cfg["version"], "model": cfg["model"], "seed": seed, "vocab_size": vocab_size, "max_len": args.max_len, "token_numeric_mean": token_mean, "token_numeric_std": token_std, "state_dict": model.state_dict()}, ckpt_dir / f"{stem}.pt")
     return result_df, pred_df, topk_df, history
 
+def is_clearml_agent_run() -> bool:
+    return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("TRAINS_TASK_ID"))
 
-def maybe_init_clearml(args, config):
-    if not args.enable_clearml:
-        return None
+
+def build_clearml_config(args) -> dict:
+    config = vars(args).copy()
+
+    for key in ["sequence_data_dir", "output_dir"]:
+        if key in config:
+            config[key] = str(config[key])
+
+    return config
+
+
+def sync_args_from_clearml_config(args, config: dict) -> None:
+    path_keys = {"sequence_data_dir", "output_dir"}
+    int_keys = {"max_len", "batch_size", "num_workers", "epochs", "patience"}
+    float_keys = {"learning_rate", "weight_decay", "grad_clip"}
+    bool_keys = {"save_checkpoints"}
+
+    # Не синхронизируем эти флаги на remote, чтобы задача не пыталась enqueue-нуть сама себя.
+    skip_keys = {"enable_clearml", "execute_remotely"}
+
+    for key, value in config.items():
+        if key in skip_keys:
+            continue
+        if not hasattr(args, key):
+            continue
+
+        if key in path_keys:
+            setattr(args, key, Path(value))
+        elif key in int_keys:
+            setattr(args, key, int(value))
+        elif key in float_keys:
+            setattr(args, key, float(value))
+        elif key in bool_keys:
+            if isinstance(value, str):
+                setattr(args, key, value.lower() in {"1", "true", "yes", "y"})
+            else:
+                setattr(args, key, bool(value))
+        else:
+            setattr(args, key, value)
+
+def maybe_init_clearml(args, config: dict):
+    remote_agent_run = is_clearml_agent_run()
+
+    if not args.enable_clearml and not remote_agent_run:
+        return None, config
 
     from clearml import Task
 
-    task = Task.init(
-        project_name=args.clearml_project,
-        task_name=args.clearml_task_name,
-        output_uri=args.clearml_output_uri or None,
-    )
+    if not remote_agent_run:
+        Task.force_requirements_env_freeze(False, "requirements.txt")
 
-    task.connect(config)
+    should_execute_remotely = args.execute_remotely and not remote_agent_run
 
-    if args.execute_remotely:
+    if remote_agent_run:
+        task = Task.current_task()
+        if task is None:
+            task = Task.init(
+                project_name=args.clearml_project,
+                task_name=args.clearml_task_name,
+                output_uri=args.clearml_output_uri or None,
+                auto_connect_arg_parser=False,
+            )
+    else:
+        task = Task.init(
+            project_name=args.clearml_project,
+            task_name=args.clearml_task_name,
+            output_uri=args.clearml_output_uri or None,
+            auto_connect_arg_parser=False,
+        )
+
+    connected_config = task.connect(config)
+    connected_config = dict(connected_config)
+
+    sync_args_from_clearml_config(args, connected_config)
+
+    print("Resolved ClearML parameters:")
+    print(f"  remote_agent_run = {remote_agent_run}")
+    print(f"  seeds = {args.seeds}")
+    print(f"  sequence_data_dir = {args.sequence_data_dir}")
+    print(f"  sequence_data_s3_prefix = {args.sequence_data_s3_prefix}")
+    print(f"  output_dir = {args.output_dir}")
+    print(f"  device = {args.device}")
+    print(f"  clearml_queue = {args.clearml_queue}")
+
+    if should_execute_remotely:
         print(f"Enqueueing ClearML task to queue: {args.clearml_queue}")
         task.execute_remotely(
             queue_name=args.clearml_queue,
             exit_process=True,
         )
 
-    return task
+    return task, connected_config
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence-data-dir", type=Path, default=Path("ehrshot_sequence_datasets"))
+    parser.add_argument(
+        "--sequence-data-s3-prefix",
+        type=str,
+        default="",
+        help="MinIO/S3 prefix with sequence datasets.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("ehrshot_multiseed_numeric_sequence_results"))
     parser.add_argument("--seeds", type=str, default="42,43,44,45,46")
     parser.add_argument("--device", type=str, default="auto")
@@ -460,14 +596,19 @@ def main():
     parser.add_argument("--clearml-task-name", type=str, default="numeric_sequence_multiseed_stability")
     parser.add_argument("--clearml-output-uri", type=str, default="s3://api.blackhole2.ai.innopolis.university:443/pershin-medailab")
     args = parser.parse_args()
+    config = build_clearml_config(args)
+    config["configs"] = DEFAULT_CONFIGS
+
+    clearml_task, config = maybe_init_clearml(args, config)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     seeds = parse_int_list(args.seeds)
 
-    config = vars(args).copy()
-    config["seeds"] = seeds
-    config["configs"] = DEFAULT_CONFIGS
-
-    clearml_task = maybe_init_clearml(args, config)
+    args.sequence_data_dir = maybe_download_sequence_datasets_from_s3_prefix(
+        sequence_data_dir=args.sequence_data_dir,
+        sequence_data_s3_prefix=args.sequence_data_s3_prefix,
+        configs=DEFAULT_CONFIGS,
+    )
 
     device = get_device(args.device)
     print("DEVICE:", device)
