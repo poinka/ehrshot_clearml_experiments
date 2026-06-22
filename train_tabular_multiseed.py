@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import shutil
+import os
 
 import numpy as np
 import pandas as pd
@@ -269,30 +270,48 @@ def sync_args_from_clearml_config(args, config: dict) -> None:
         else:
             setattr(args, key, value)
 
+def is_clearml_agent_run() -> bool:
+    return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("TRAINS_TASK_ID"))
+
 def maybe_init_clearml(args, config: dict):
-    if not args.enable_clearml:
+    remote_agent_run = is_clearml_agent_run()
+
+    # Локальный запуск без ClearML: ничего не делаем.
+    # Remote agent run: ClearML уже есть, даже если CLI --enable-clearml не передан.
+    if not args.enable_clearml and not remote_agent_run:
         return None, config
 
     from clearml import Task
 
-    Task.force_requirements_env_freeze(False, "requirements.txt")
+    if not remote_agent_run:
+        Task.force_requirements_env_freeze(False, "requirements.txt")
 
-    should_execute_remotely = args.execute_remotely
+    should_execute_remotely = args.execute_remotely and not remote_agent_run
 
-    task = Task.init(
-        project_name=args.clearml_project,
-        task_name=args.clearml_task_name,
-        output_uri=args.clearml_output_uri or None,
-        auto_connect_arg_parser=False,
-    )
+    if remote_agent_run:
+        task = Task.current_task()
+        if task is None:
+            task = Task.init(
+                project_name=args.clearml_project,
+                task_name=args.clearml_task_name,
+                output_uri=args.clearml_output_uri or None,
+                auto_connect_arg_parser=False,
+            )
+    else:
+        task = Task.init(
+            project_name=args.clearml_project,
+            task_name=args.clearml_task_name,
+            output_uri=args.clearml_output_uri or None,
+            auto_connect_arg_parser=False,
+        )
 
-    # Важно: connect для dict возвращает proxy-dict.
-    # Именно его надо использовать дальше.
-    config = task.connect(config)
+    connected_config = task.connect(config)
+    connected_config = dict(connected_config)
 
-    sync_args_from_clearml_config(args, dict(config))
+    sync_args_from_clearml_config(args, connected_config)
 
     print("Resolved ClearML parameters:")
+    print(f"  remote_agent_run = {remote_agent_run}")
     print(f"  seeds = {args.seeds}")
     print(f"  cache_dir = {args.cache_dir}")
     print(f"  cache_s3_prefix = {args.cache_s3_prefix}")
@@ -306,7 +325,7 @@ def maybe_init_clearml(args, config: dict):
             exit_process=True,
         )
 
-    return task, config
+    return task, connected_config
 
 
 def main():
@@ -338,8 +357,8 @@ def main():
     parser.add_argument("--clearml-project", type=str, default="pershin-medailab/EHR_Risk_Profiling/EHRSHOT")
     parser.add_argument("--clearml-task-name", type=str, default="tabular_multiseed_stability")
     parser.add_argument("--clearml-output-uri", type=str, default="s3://api.blackhole2.ai.innopolis.university:443/pershin-medailab")
+    
     args = parser.parse_args()
-
 
     config = build_clearml_config(args)
     task, config = maybe_init_clearml(args, config)
