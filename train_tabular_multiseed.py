@@ -271,26 +271,33 @@ def sync_args_from_clearml_config(args, config: dict) -> None:
 
 def maybe_init_clearml(args, config: dict):
     if not args.enable_clearml:
-        return None
+        return None, config
 
     from clearml import Task
 
     Task.force_requirements_env_freeze(False, "requirements.txt")
 
-    # Важно сохранить локальное значение ДО sync.
-    # На remote run args.execute_remotely будет False, потому что CLI-аргументов нет.
     should_execute_remotely = args.execute_remotely
 
     task = Task.init(
         project_name=args.clearml_project,
         task_name=args.clearml_task_name,
         output_uri=args.clearml_output_uri or None,
+        auto_connect_arg_parser=False,
     )
 
-    task.connect(config)
+    # Важно: connect для dict возвращает proxy-dict.
+    # Именно его надо использовать дальше.
+    config = task.connect(config)
 
-    # Вот это ключевая строка: подтягиваем параметры из ClearML обратно в args.
-    sync_args_from_clearml_config(args, config)
+    sync_args_from_clearml_config(args, dict(config))
+
+    print("Resolved ClearML parameters:")
+    print(f"  seeds = {args.seeds}")
+    print(f"  cache_dir = {args.cache_dir}")
+    print(f"  cache_s3_prefix = {args.cache_s3_prefix}")
+    print(f"  output_dir = {args.output_dir}")
+    print(f"  clearml_queue = {args.clearml_queue}")
 
     if should_execute_remotely:
         print(f"Enqueueing ClearML task to queue: {args.clearml_queue}")
@@ -299,7 +306,7 @@ def maybe_init_clearml(args, config: dict):
             exit_process=True,
         )
 
-    return task
+    return task, config
 
 
 def main():
@@ -335,7 +342,7 @@ def main():
 
 
     config = build_clearml_config(args)
-    task = maybe_init_clearml(args, config)
+    task, config = maybe_init_clearml(args, config)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     seeds = parse_int_list(args.seeds)
