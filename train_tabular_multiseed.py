@@ -230,6 +230,44 @@ def run_one_seed_task_model(df: pd.DataFrame, task: str, model_name: str, seed: 
     topk_df.to_csv(out_dir / f"{stem}__topk.csv", index=False)
     return result_df, pred_df, topk_df
 
+def build_clearml_config(args) -> dict:
+    config = vars(args).copy()
+
+    # ClearML ругается на PosixPath, поэтому храним пути как строки.
+    for key in ["cache_dir", "output_dir"]:
+        if key in config:
+            config[key] = str(config[key])
+
+    return config
+
+
+def sync_args_from_clearml_config(args, config: dict) -> None:
+    """
+    On remote ClearML agent the script is executed without CLI arguments.
+    task.connect(config) loads saved task parameters into config,
+    but it does not automatically update argparse Namespace.
+    This function writes ClearML values back into args.
+    """
+    path_keys = {"cache_dir", "output_dir"}
+    int_keys = {"top_n_codes", "top_n_numeric_codes"}
+
+    # Не синхронизируем execute_remotely, иначе remote-задача может попытаться
+    # заново enqueue-нуть сама себя.
+    skip_keys = {"enable_clearml", "execute_remotely"}
+
+    for key, value in config.items():
+        if key in skip_keys:
+            continue
+
+        if not hasattr(args, key):
+            continue
+
+        if key in path_keys:
+            setattr(args, key, Path(value))
+        elif key in int_keys:
+            setattr(args, key, int(value))
+        else:
+            setattr(args, key, value)
 
 def maybe_init_clearml(args, config: dict):
     if not args.enable_clearml:
@@ -238,7 +276,11 @@ def maybe_init_clearml(args, config: dict):
     from clearml import Task
 
     Task.force_requirements_env_freeze(False, "requirements.txt")
-    
+
+    # Важно сохранить локальное значение ДО sync.
+    # На remote run args.execute_remotely будет False, потому что CLI-аргументов нет.
+    should_execute_remotely = args.execute_remotely
+
     task = Task.init(
         project_name=args.clearml_project,
         task_name=args.clearml_task_name,
@@ -247,7 +289,10 @@ def maybe_init_clearml(args, config: dict):
 
     task.connect(config)
 
-    if args.execute_remotely:
+    # Вот это ключевая строка: подтягиваем параметры из ClearML обратно в args.
+    sync_args_from_clearml_config(args, config)
+
+    if should_execute_remotely:
         print(f"Enqueueing ClearML task to queue: {args.clearml_queue}")
         task.execute_remotely(
             queue_name=args.clearml_queue,
@@ -288,11 +333,12 @@ def main():
     parser.add_argument("--clearml-output-uri", type=str, default="s3://api.blackhole2.ai.innopolis.university:443/pershin-medailab")
     args = parser.parse_args()
 
+
+    config = build_clearml_config(args)
+    task = maybe_init_clearml(args, config)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     seeds = parse_int_list(args.seeds)
-    config = vars(args).copy()
-    config["seeds"] = seeds
-    task = maybe_init_clearml(args, config)
 
     args.cache_dir = maybe_download_tabular_cache_from_s3_prefix(
         cache_dir=args.cache_dir,
@@ -301,6 +347,7 @@ def main():
         top_n_codes=args.top_n_codes,
         top_n_numeric_codes=args.top_n_numeric_codes,
     )
+
     all_results, all_predictions, all_topk = [], [], []
     for cfg in DEFAULT_CONFIGS:
         df = load_cached_features(args.cache_dir, cfg["task"], args.top_n_codes, args.top_n_numeric_codes)
