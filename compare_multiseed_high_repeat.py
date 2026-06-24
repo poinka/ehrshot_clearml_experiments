@@ -8,7 +8,7 @@ import shutil
 import numpy as np
 import pandas as pd
 
-from common_ehrshot_eval import binary_ranking_metrics, paired_bootstrap_delta, safe_metric, topk_metrics
+from common_ehrshot_eval import binary_ranking_metrics, safe_metric, topk_metrics
 
 TASKS = ["guo_readmission", "guo_icu"]
 
@@ -545,8 +545,130 @@ def get_cfg_df(df: pd.DataFrame, key: str, high_repeat_group: bool) -> pd.DataFr
 
     return out
 
+def summarize_bootstrap_values(values) -> dict:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
 
-def run_pairwise_bootstrap(ens: pd.DataFrame, n_bootstrap: int, seed: int) -> pd.DataFrame:
+    if len(values) == 0:
+        return {
+            "mean": np.nan,
+            "std": np.nan,
+            "ci_low": np.nan,
+            "ci_high": np.nan,
+            "n_valid": 0,
+        }
+
+    return {
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
+        "ci_low": float(np.quantile(values, 0.025)),
+        "ci_high": float(np.quantile(values, 0.975)),
+        "n_valid": int(len(values)),
+    }
+
+
+def paired_cluster_bootstrap_delta(
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    metrics: list[str],
+    n_bootstrap: int = 1000,
+    seed: int = 42,
+    cluster_col: str = "subject_id",
+) -> pd.DataFrame:
+    """
+    Paired bootstrap comparison with resampling by patient/cluster.
+
+    Instead of resampling individual prediction examples, this function samples
+    subject_id values with replacement and then includes all examples belonging
+    to each sampled patient.
+
+    This is needed because one patient can have several prediction examples,
+    and these examples are not independent.
+    """
+    keep = ["task", "row_id", "subject_id", "y_true", "risk"]
+
+    a = df_a[keep].rename(columns={"risk": "risk_a"})
+    b = df_b[keep].rename(columns={"risk": "risk_b"})
+
+    merged = a.merge(
+        b,
+        on=["task", "row_id", "subject_id", "y_true"],
+        how="inner",
+    )
+
+    if merged.empty:
+        raise ValueError("Paired merge produced 0 rows")
+
+    if cluster_col not in merged.columns:
+        raise ValueError(f"cluster_col={cluster_col} is not in merged dataframe")
+
+    y = merged["y_true"].to_numpy().astype(int)
+    pa = merged["risk_a"].to_numpy().astype(float)
+    pb = merged["risk_b"].to_numpy().astype(float)
+
+    # group row indices by patient
+    cluster_groups = [
+        np.asarray(idx, dtype=np.int64)
+        for idx in merged.groupby(cluster_col, sort=False).indices.values()
+    ]
+
+    n_examples = len(merged)
+    n_clusters = len(cluster_groups)
+    n_positive = int(y.sum())
+
+    rng = np.random.default_rng(seed)
+    rows = []
+
+    print(
+        f"Cluster bootstrap: n_examples={n_examples}, "
+        f"n_{cluster_col}={n_clusters}, n_positive={n_positive}"
+    )
+
+    for metric in metrics:
+        point = safe_metric(y, pa, metric) - safe_metric(y, pb, metric)
+
+        vals = []
+        for _ in range(n_bootstrap):
+            sampled_cluster_ids = rng.integers(0, n_clusters, size=n_clusters)
+
+            # If a patient is sampled twice, all their examples are included twice.
+            # This matches bootstrap with replacement at the patient level.
+            sample_idx = np.concatenate(
+                [cluster_groups[i] for i in sampled_cluster_ids]
+            )
+
+            vals.append(
+                safe_metric(y[sample_idx], pa[sample_idx], metric)
+                - safe_metric(y[sample_idx], pb[sample_idx], metric)
+            )
+
+        s = summarize_bootstrap_values(vals)
+
+        rows.append(
+            {
+                "metric": metric,
+                "point_delta_a_minus_b": point,
+                "bootstrap_mean_delta": s["mean"],
+                "bootstrap_std_delta": s["std"],
+                "ci_low": s["ci_low"],
+                "ci_high": s["ci_high"],
+                "n_bootstrap_valid": s["n_valid"],
+                "n_bootstrap_requested": int(n_bootstrap),
+                "bootstrap_unit": cluster_col,
+                "n_paired_examples": int(n_examples),
+                "n_paired_patients": int(n_clusters),
+                "n_paired_positive": int(n_positive),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+def run_pairwise_bootstrap(
+    ens: pd.DataFrame,
+    n_bootstrap: int,
+    seed: int,
+    cluster_col: str = "subject_id",
+) -> pd.DataFrame:
     rows = []
 
     for cmp_cfg in PAIRWISE_COMPARISONS:
@@ -556,12 +678,18 @@ def run_pairwise_bootstrap(ens: pd.DataFrame, n_bootstrap: int, seed: int) -> pd
             a = get_cfg_df(ens, cmp_cfg["a"], hrg)
             b = get_cfg_df(ens, cmp_cfg["b"], hrg)
 
-            delta = paired_bootstrap_delta(
+            print("=" * 100)
+            print(f"Comparison: {cmp_cfg['comparison']}")
+            print(f"Group: {group_name(hrg)}")
+            print(f"Bootstrap unit: {cluster_col}")
+
+            delta = paired_cluster_bootstrap_delta(
                 a,
                 b,
                 METRICS,
                 n_bootstrap=n_bootstrap,
                 seed=seed,
+                cluster_col=cluster_col,
             )
 
             for _, r in delta.iterrows():
@@ -572,8 +700,14 @@ def run_pairwise_bootstrap(ens: pd.DataFrame, n_bootstrap: int, seed: int) -> pd
                         "high_repeat_group": hrg,
                         "comparison": cmp_cfg["comparison"],
                         "description": cmp_cfg["description"],
-                        "model_a": f"{a['family'].iloc[0]}: {a['version'].iloc[0]} + {a['model'].iloc[0]}",
-                        "model_b": f"{b['family'].iloc[0]}: {b['version'].iloc[0]} + {b['model'].iloc[0]}",
+                        "model_a": (
+                            f"{a['family'].iloc[0]}: "
+                            f"{a['version'].iloc[0]} + {a['model'].iloc[0]}"
+                        ),
+                        "model_b": (
+                            f"{b['family'].iloc[0]}: "
+                            f"{b['version'].iloc[0]} + {b['model'].iloc[0]}"
+                        ),
                         **r.to_dict(),
                     }
                 )
@@ -657,13 +791,32 @@ def main():
     ens_perf = ensemble_performance(ens)
     ens_perf.to_csv(args.output_dir / "ensemble_subgroup_performance.csv", index=False)
 
-    deltas = run_pairwise_bootstrap(ens, n_bootstrap=args.bootstrap, seed=args.seed)
+    deltas = run_pairwise_bootstrap(
+        ens,
+        n_bootstrap=args.bootstrap,
+        seed=args.seed,
+    )
     deltas.to_csv(args.output_dir / "ensemble_paired_bootstrap_delta.csv", index=False)
 
     auprc = deltas[deltas["metric"] == "auprc"].copy()
     auprc["delta_auprc_with_ci"] = auprc.apply(lambda r: f"{r['point_delta_a_minus_b']:+.3f} [{r['ci_low']:+.3f}, {r['ci_high']:+.3f}]", axis=1)
-    auprc[["task", "group_name", "comparison", "model_a", "model_b", "n_paired_examples", "n_paired_positive", "delta_auprc_with_ci"]].to_csv(args.output_dir / "huly_paired_auprc_delta_table.csv", index=False)
+    huly_cols = [
+        "task",
+        "group_name",
+        "comparison",
+        "model_a",
+        "model_b",
+        "bootstrap_unit",
+        "n_paired_patients",
+        "n_paired_examples",
+        "n_paired_positive",
+        "delta_auprc_with_ci",
+    ]
 
+    auprc[huly_cols].to_csv(
+        args.output_dir / "huly_paired_auprc_delta_table.csv",
+        index=False,
+    )
     if clearml_task is not None:
         clearml_task.upload_artifact(
             "single_seed_subgroup_metrics",
