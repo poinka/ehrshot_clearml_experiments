@@ -29,7 +29,6 @@ import os
 import shutil
 import sys
 import traceback
-import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -925,16 +924,6 @@ def upload_directory_to_s3(local_dir: Path, output_s3_prefix: str) -> None:
         StorageManager.upload_file(local_file=str(p), remote_url=remote_url, wait_for_upload=True)
 
 
-def zip_dir(src_dir: Path, zip_path: Path) -> Path:
-    if zip_path.exists():
-        zip_path.unlink()
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for p in src_dir.rglob("*"):
-            if p.is_file():
-                zf.write(p, arcname=p.relative_to(src_dir.parent))
-    return zip_path
-
-
 def is_clearml_agent_run() -> bool:
     return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("TRAINS_TASK_ID"))
 
@@ -1149,7 +1138,8 @@ def build_one_task(args: argparse.Namespace, task: str, versions: list[str], aud
                 "source_vocab_size": int(len(source_vocab)),
                 "note": (
                     "Built from cached sequence examples, not raw EHRSHOT_MEDS. "
-                    "Visit-level dedup is approximated by same-day dedup using rounded days_before_prediction. "
+                    "Visit-level dedup is approximated using reconstructed visit buckets from Visit/ anchor tokens, "
+                    "with rounded-day fallback when no nearby Visit/ anchor is available. "
                     "Original token ids are preserved for existing source codes; synthetic compression tokens are appended."
                 ),
             }
@@ -1241,9 +1231,10 @@ def main() -> None:
             upload_directory_to_s3(args.output_dir, args.output_s3_prefix)
 
         if clearml_task is not None:
-            clearml_task.upload_artifact("all_compression_version_summary", summary_df)
-            zip_path = zip_dir(args.output_dir, args.output_dir.parent / f"{args.output_dir.name}.zip")
-            clearml_task.upload_artifact("sequence_compression_datasets_zip", artifact_object=str(zip_path))
+            clearml_task.get_logger().report_text(
+                f"Datasets were saved directly to MinIO/S3 as files and folders: "
+                f"{args.output_s3_prefix.rstrip('/')}"
+            )
 
         print("=" * 100)
         print("DONE")
