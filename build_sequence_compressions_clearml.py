@@ -302,18 +302,124 @@ def make_event(idx: float, code: str, day: float, num: float = float("nan"), syn
     }
 
 
-def dedup_same_day(events: list[dict[str, Any]], compressible: set[str]) -> list[dict[str, Any]]:
-    """Approximation of visit/day dedup from cached sequences: same code + same rounded day before prediction."""
-    seen: set[tuple[str, int]] = set()
-    out: list[dict[str, Any]] = []
+VISIT_ANCHOR_MAX_DAYS = 30.0
+
+
+def is_visit_anchor_code(code: str) -> bool:
+    """
+    Visit anchor used to reconstruct approximate visit buckets.
+
+    We do not have real visit_id in cached sequence, but we do have Visit/ tokens.
+    These tokens are used as approximate anchors for grouping nearby events.
+    """
+    c = str(code).strip().upper()
+    return (
+        c.startswith("VISIT/")
+        or c.startswith("VISIT_")
+        or c == "VISIT"
+        or c.startswith("VISIT:")
+    )
+
+
+def assign_reconstructed_visit_buckets(
+    events: list[dict[str, Any]],
+    max_anchor_gap_days: float = VISIT_ANCHOR_MAX_DAYS,
+) -> list[dict[str, Any]]:
+    """
+    Assign each event to an approximate visit bucket using Visit/ anchors.
+
+    Rule:
+    - if the event itself is Visit/, it defines a visit bucket;
+    - otherwise assign to the nearest Visit/ anchor within max_anchor_gap_days;
+    - if no nearby Visit/ anchor exists, fallback to rounded day bucket.
+
+    This matches our project assumption: no reliable native visit_id, but visits are
+    approximated from Visit/ events.
+    """
+    visit_anchors = []
+
     for e in events:
-        code = e["code"]
+        if is_visit_anchor_code(e["code"]):
+            visit_anchors.append(
+                {
+                    "idx": float(e["idx"]),
+                    "day": float(e["day"]),
+                    "code": str(e["code"]),
+                    "bucket": f"visit::{str(e['code'])}::{float(e['idx']):.6f}::{float(e['day']):.6f}",
+                }
+            )
+
+    out = []
+
+    for e in events:
+        e = dict(e)
+        day = float(e["day"])
+
+        if is_visit_anchor_code(e["code"]):
+            e["visit_bucket"] = f"visit::{str(e['code'])}::{float(e['idx']):.6f}::{day:.6f}"
+            out.append(e)
+            continue
+
+        best_anchor = None
+        best_key = None
+
+        for anchor in visit_anchors:
+            day_gap = abs(day - float(anchor["day"]))
+
+            if day_gap > max_anchor_gap_days:
+                continue
+
+            # Prefer closest in time; tie-break by sequence distance.
+            candidate_key = (day_gap, abs(float(e["idx"]) - float(anchor["idx"])))
+
+            if best_key is None or candidate_key < best_key:
+                best_key = candidate_key
+                best_anchor = anchor
+
+        if best_anchor is not None:
+            e["visit_bucket"] = best_anchor["bucket"]
+        else:
+            e["visit_bucket"] = f"day::{int(round(day))}"
+
+        out.append(e)
+
+    return out
+
+
+def dedup_by_reconstructed_visit(
+    events: list[dict[str, Any]],
+    compressible: set[str],
+    max_anchor_gap_days: float = VISIT_ANCHOR_MAX_DAYS,
+) -> list[dict[str, Any]]:
+    """
+    Deduplicate compressible chronic diagnosis codes inside reconstructed visits.
+
+    Key:
+        chronic diagnosis code + reconstructed visit bucket
+
+    Non-compressible events are never deduplicated.
+    """
+    events = assign_reconstructed_visit_buckets(
+        events,
+        max_anchor_gap_days=max_anchor_gap_days,
+    )
+
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, Any]] = []
+
+    for e in events:
+        code = str(e["code"])
+
         if code in compressible:
-            key = (code, int(round(float(e["day"]))))
+            key = (code, str(e["visit_bucket"]))
+
             if key in seen:
                 continue
+
             seen.add(key)
+
         out.append(e)
+
     return out
 
 
@@ -356,7 +462,11 @@ def split_into_eras(es: list[dict[str, Any]], max_gap_days: int) -> list[list[di
     return eras
 
 
-def compress_condition_era(events: list[dict[str, Any]], compressible: set[str], max_gap_days: int) -> list[dict[str, Any]]:
+def compress_condition_era(
+    events: list[dict[str, Any]],
+    compressible: set[str],
+    max_gap_days: int,
+) -> list[dict[str, Any]]:
     by_code: dict[str, list[dict[str, Any]]] = defaultdict(list)
     out: list[dict[str, Any]] = []
 
@@ -366,15 +476,48 @@ def compress_condition_era(events: list[dict[str, Any]], compressible: set[str],
         else:
             out.append(e)
 
+    eps = 1e-4
+
     for code, es in by_code.items():
         for era in split_into_eras(es, max_gap_days):
             if len(era) <= 1:
                 out.extend(era)
                 continue
+
             first, last = era[0], era[-1]
             span = max(float(first["day"]) - float(last["day"]), 0.0)
-            out.append(make_event(first["idx"], f"DX_ERA{max_gap_days}_START/{code}", first["day"], 0.0, True))
-            out.append(make_event(last["idx"], f"DX_ERA{max_gap_days}_END/{code}", last["day"], span, True))
+            cnt = len(era)
+            recency = max(float(last["day"]), 0.0)
+
+            prefix = f"DX_ERA{max_gap_days}"
+
+            out.append(
+                make_event(
+                    first["idx"],
+                    f"{prefix}_START/{code}",
+                    first["day"],
+                    0.0,
+                    True,
+                )
+            )
+            out.append(
+                make_event(
+                    last["idx"] + eps,
+                    f"{prefix}_END/{code}",
+                    last["day"],
+                    span,
+                    True,
+                )
+            )
+            out.append(
+                make_event(
+                    last["idx"] + 2 * eps,
+                    f"{prefix}_COUNT_BIN/{count_bin(cnt)}/{code}",
+                    last["day"],
+                    float(cnt),
+                    True,
+                )
+            )
 
     return sorted(out, key=lambda x: x["idx"])
 
@@ -423,15 +566,15 @@ def apply_compression_to_row(row: pd.Series, version: str, compressible: set[str
     if version == "raw":
         out_events = raw_events
     elif version == "compressed_dedup":
-        out_events = dedup_same_day(raw_events, compressible)
+        out_events = dedup_by_reconstructed_visit(raw_events, compressible)
     elif version == "compressed_first_last":
-        out_events = compress_first_last(dedup_same_day(raw_events, compressible), compressible)
+        out_events = compress_first_last(dedup_by_reconstructed_visit(raw_events, compressible), compressible)
     elif version.startswith("condition_era_"):
         gap = int(version.rsplit("_", 1)[-1])
-        out_events = compress_condition_era(dedup_same_day(raw_events, compressible), compressible, gap)
+        out_events = compress_condition_era(dedup_by_reconstructed_visit(raw_events, compressible), compressible, gap)
     elif version.startswith("state_duration_"):
         gap = int(version.rsplit("_", 1)[-1])
-        out_events = compress_state_duration(dedup_same_day(raw_events, compressible), compressible, gap)
+        out_events = compress_state_duration(dedup_by_reconstructed_visit(raw_events, compressible), compressible, gap)
     else:
         raise ValueError(f"Unknown compression version: {version}")
 
