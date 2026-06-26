@@ -488,55 +488,120 @@ def build_high_repeat_group(sequence_dir: Path, tasks: list[str], baseline_versi
 
 
 def build_sequence_cost_summary(sequence_dir: Path, tasks: list[str], high_repeat_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Build cost table for each compression version.
+
+    Robustness note:
+    Some cached examples already contain helper columns such as raw_seq_len or
+    events_removed_vs_raw. If we merge them as-is with raw_small, pandas may add
+    suffixes (_x/_y), and the expected raw_seq_len column disappears. Therefore
+    we drop stale helper columns before merging and compute the cost columns fresh.
+    """
     rows = []
     if not sequence_dir.exists():
         return pd.DataFrame(rows)
 
+    stale_cost_cols = {
+        "raw_seq_len",
+        "raw_n_diagnosis_like_events",
+        "raw_n_compressible_chronic_events",
+        "events_removed_vs_raw",
+        "diagnosis_like_removed_vs_raw",
+        "compressible_chronic_removed_vs_raw",
+    }
+
     for task_dir in sorted(sequence_dir.iterdir()):
         if not task_dir.is_dir() or task_dir.name not in tasks:
             continue
+
         task = task_dir.name
         raw = load_examples(sequence_dir, task, "raw")
-        if raw is None:
+        if raw is None or "seq_len" not in raw.columns:
+            print(f"WARNING: cannot build cost summary for task={task}: missing raw examples or seq_len")
             continue
-        cols = ["row_id", "subject_id", "split", "seq_len"]
+
+        raw_cols = ["row_id", "subject_id", "split", "seq_len"]
         if "n_diagnosis_like_events" in raw.columns:
-            cols.append("n_diagnosis_like_events")
+            raw_cols.append("n_diagnosis_like_events")
         if "n_compressible_chronic_events" in raw.columns:
-            cols.append("n_compressible_chronic_events")
-        raw_small = raw[cols].copy().rename(columns={
+            raw_cols.append("n_compressible_chronic_events")
+
+        raw_small = raw[raw_cols].copy().rename(columns={
             "seq_len": "raw_seq_len",
             "n_diagnosis_like_events": "raw_n_diagnosis_like_events",
             "n_compressible_chronic_events": "raw_n_compressible_chronic_events",
         })
 
+        # One row per prediction example. If duplicates ever appear, keep first
+        # to avoid accidental many-to-many merge explosion.
+        raw_small = raw_small.drop_duplicates(subset=["row_id", "subject_id", "split"])
+
         for version_dir in sorted(task_dir.iterdir()):
             if not version_dir.is_dir():
                 continue
+
             version = version_dir.name
             df = load_examples(sequence_dir, task, version)
             if df is None or "seq_len" not in df.columns:
+                print(f"WARNING: skip cost summary task={task} version={version}: missing examples or seq_len")
                 continue
-            merged = df.merge(raw_small, on=["row_id", "subject_id", "split"], how="left")
+
+            # Drop stale helper columns from cached datasets so merge creates stable names.
+            df = df.drop(columns=[c for c in stale_cost_cols if c in df.columns], errors="ignore")
+
+            merged = df.merge(
+                raw_small,
+                on=["row_id", "subject_id", "split"],
+                how="left",
+                validate="many_to_one",
+            )
+
+            if "raw_seq_len" not in merged.columns:
+                raise KeyError(
+                    f"raw_seq_len missing after merge for task={task}, version={version}. "
+                    f"Columns: {list(merged.columns)[:80]}"
+                )
+
             merged["events_removed_vs_raw"] = merged["raw_seq_len"] - merged["seq_len"]
+
             if "raw_n_diagnosis_like_events" in merged.columns and "n_diagnosis_like_events" in merged.columns:
-                merged["diagnosis_like_removed_vs_raw"] = merged["raw_n_diagnosis_like_events"] - merged["n_diagnosis_like_events"]
+                merged["diagnosis_like_removed_vs_raw"] = (
+                    merged["raw_n_diagnosis_like_events"] - merged["n_diagnosis_like_events"]
+                )
             else:
                 merged["diagnosis_like_removed_vs_raw"] = np.nan
+
             if "raw_n_compressible_chronic_events" in merged.columns and "n_compressible_chronic_events" in merged.columns:
-                merged["compressible_chronic_removed_vs_raw"] = merged["raw_n_compressible_chronic_events"] - merged["n_compressible_chronic_events"]
+                merged["compressible_chronic_removed_vs_raw"] = (
+                    merged["raw_n_compressible_chronic_events"] - merged["n_compressible_chronic_events"]
+                )
             else:
                 merged["compressible_chronic_removed_vs_raw"] = np.nan
 
-            split_parts = [("all", merged), ("held_out", merged[merged["split"] == "held_out"])]
+            split_parts = [
+                ("all", merged),
+                ("held_out", merged[merged["split"] == "held_out"]),
+            ]
+
             if high_repeat_df is not None and len(high_repeat_df):
                 h = high_repeat_df[(high_repeat_df["task"] == task) & (high_repeat_df["high_repeat_group"])]
-                high_part = merged.merge(h[["task", "row_id", "subject_id", "high_repeat_group"]], on=["task", "row_id", "subject_id"], how="inner")
-                split_parts.append(("held_out_high_repeat", high_part))
+                if len(h):
+                    high_part = merged.merge(
+                        h[["task", "row_id", "subject_id", "high_repeat_group"]],
+                        on=["task", "row_id", "subject_id"],
+                        how="inner",
+                    )
+                    split_parts.append(("held_out_high_repeat", high_part))
 
             for split_name, part in split_parts:
                 if len(part) == 0:
                     continue
+
+                n_compression_events = (
+                    part["n_compression_events"]
+                    if "n_compression_events" in part.columns
+                    else pd.Series(np.zeros(len(part)), index=part.index)
+                )
+
                 rows.append({
                     "task": task,
                     "version": version,
@@ -550,10 +615,11 @@ def build_sequence_cost_summary(sequence_dir: Path, tasks: list[str], high_repea
                     "mean_events_removed_vs_raw": float(part["events_removed_vs_raw"].mean()),
                     "median_events_removed_vs_raw": float(part["events_removed_vs_raw"].median()),
                     "p90_events_removed_vs_raw": float(np.quantile(part["events_removed_vs_raw"], 0.90)),
-                    "mean_diagnosis_like_removed_vs_raw": float(part["diagnosis_like_removed_vs_raw"].mean()) if "diagnosis_like_removed_vs_raw" in part else np.nan,
-                    "mean_compressible_chronic_removed_vs_raw": float(part["compressible_chronic_removed_vs_raw"].mean()) if "compressible_chronic_removed_vs_raw" in part else np.nan,
-                    "mean_n_compression_events": float(part.get("n_compression_events", pd.Series([0] * len(part))).mean()),
+                    "mean_diagnosis_like_removed_vs_raw": float(part["diagnosis_like_removed_vs_raw"].mean()),
+                    "mean_compressible_chronic_removed_vs_raw": float(part["compressible_chronic_removed_vs_raw"].mean()),
+                    "mean_n_compression_events": float(n_compression_events.mean()),
                 })
+
     return pd.DataFrame(rows)
 
 
