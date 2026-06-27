@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +33,7 @@ import train_numeric_sequence_multiseed as numseq_mod
 META_COLS = {"task", "row_id", "subject_id", "prediction_time", "label", "split"}
 
 
-TASK_CONFIGS = {
+BEST_TASK_CONFIGS = {
     "guo_readmission": {
         "tabular_model": "HistGradientBoosting",
         "sequence": {
@@ -57,6 +59,38 @@ TASK_CONFIGS = {
 }
 
 
+RAW_TASK_CONFIGS = {
+    "guo_readmission": {
+        "tabular_model": "HistGradientBoosting",
+        "sequence": {
+            "version": "raw",
+            "model": "RETAIN_lite",
+        },
+        "numeric_sequence": {
+            "version": "raw",
+            "model": "RETAIN_lite_numeric",
+        },
+    },
+    "guo_icu": {
+        "tabular_model": "RandomForest_balanced",
+        "sequence": {
+            "version": "raw",
+            "model": "GRU_2L",
+        },
+        "numeric_sequence": {
+            "version": "raw",
+            "model": "GRU_2L_numeric",
+        },
+    },
+}
+
+
+TASK_CONFIG_PRESETS = {
+    "best": BEST_TASK_CONFIGS,
+    "raw": RAW_TASK_CONFIGS,
+}
+
+
 FUSION_SPECS = {
     "tabular_only": ["p_tabular"],
     "sequence_only": ["p_sequence"],
@@ -74,19 +108,23 @@ FUSION_SPECS = {
 def get_device(device_arg: str) -> torch.device:
     if device_arg != "auto":
         return torch.device(device_arg)
+
     if torch.cuda.is_available():
         return torch.device("cuda")
+
     return torch.device("cpu")
 
 
 def safe_torch_load(path: Path, device: torch.device) -> dict:
     """
-    PyTorch >= 2.6 can use weights_only=True by default.
-    Our numeric checkpoints may contain numpy arrays, so we explicitly allow full load.
+    PyTorch >= 2.6 может использовать weights_only=True по умолчанию.
+    В numeric checkpoints могут лежать numpy arrays, поэтому явно разрешаем full load.
     """
     kwargs = {"map_location": device}
+
     if "weights_only" in inspect.signature(torch.load).parameters:
         kwargs["weights_only"] = False
+
     return torch.load(path, **kwargs)
 
 
@@ -99,7 +137,11 @@ def prob_to_logit(p: np.ndarray) -> np.ndarray:
     return np.log(p / (1.0 - p))
 
 
-def transform_score_features(x: pd.DataFrame, score_cols: list[str], mode: str) -> np.ndarray:
+def transform_score_features(
+    x: pd.DataFrame,
+    score_cols: list[str],
+    mode: str,
+) -> np.ndarray:
     arr = x[score_cols].to_numpy(dtype=float)
 
     if mode == "prob":
@@ -135,11 +177,337 @@ def make_tabular_model(model_name: str, seed: int):
     raise ValueError(f"Unknown tabular model: {model_name}")
 
 
-def load_tabular_features(cache_dir: Path, task: str, top_n_codes: int, top_n_numeric_codes: int) -> pd.DataFrame:
+def load_tabular_features(
+    cache_dir: Path,
+    task: str,
+    top_n_codes: int,
+    top_n_numeric_codes: int,
+) -> pd.DataFrame:
     path = cache_dir / f"{task}_features_top{top_n_codes}_num{top_n_numeric_codes}.parquet"
+
     if not path.exists():
         raise FileNotFoundError(f"Tabular feature cache not found: {path}")
+
     return pd.read_parquet(path)
+
+
+def maybe_download_tabular_cache_from_s3_prefix(
+    cache_dir: Path,
+    cache_s3_prefix: str,
+    tasks: list[str],
+    top_n_codes: int,
+    top_n_numeric_codes: int,
+) -> Path:
+    """
+    Если tabular cache есть локально, используем его.
+    Иначе скачиваем нужные parquet из MinIO/S3.
+
+    Expected remote layout:
+        <cache_s3_prefix>/guo_readmission_features_top500_num40.parquet
+        <cache_s3_prefix>/guo_icu_features_top500_num40.parquet
+    """
+    expected_files = [
+        cache_dir / f"{task}_features_top{top_n_codes}_num{top_n_numeric_codes}.parquet"
+        for task in tasks
+    ]
+
+    if all(p.exists() for p in expected_files):
+        print(f"Using local tabular cache: {cache_dir}")
+        return cache_dir
+
+    if not cache_s3_prefix:
+        missing = [str(p) for p in expected_files if not p.exists()]
+        raise FileNotFoundError(
+            "Tabular cache files are missing locally and --cache-s3-prefix is not provided. "
+            f"Missing files: {missing}"
+        )
+
+    from clearml import StorageManager
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    prefix = cache_s3_prefix.rstrip("/")
+
+    for task in tasks:
+        fname = f"{task}_features_top{top_n_codes}_num{top_n_numeric_codes}.parquet"
+        dst = cache_dir / fname
+
+        if dst.exists():
+            print(f"Already exists locally: {dst}")
+            continue
+
+        remote_url = f"{prefix}/{fname}"
+        print(f"Downloading {remote_url}")
+
+        local_copy = Path(StorageManager.get_local_copy(remote_url=remote_url))
+
+        if not local_copy.exists():
+            raise FileNotFoundError(f"StorageManager returned missing local file: {local_copy}")
+
+        print(f"Copying {local_copy} -> {dst}")
+        shutil.copy2(local_copy, dst)
+
+    return cache_dir
+
+
+def required_sequence_dataset_configs(
+    task_configs: dict,
+    tasks: list[str],
+) -> list[dict]:
+    configs = []
+    seen = set()
+
+    for task in tasks:
+        cfg = task_configs[task]
+
+        for role in ["sequence", "numeric_sequence"]:
+            version = cfg[role]["version"]
+            key = (task, version)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            configs.append(
+                {
+                    "task": task,
+                    "version": version,
+                    "model": cfg[role]["model"],
+                }
+            )
+
+    return configs
+
+
+def required_checkpoint_configs(
+    task_configs: dict,
+    tasks: list[str],
+    role: str,
+) -> list[dict]:
+    configs = []
+
+    for task in tasks:
+        cfg = task_configs[task][role]
+        configs.append(
+            {
+                "task": task,
+                "version": cfg["version"],
+                "model": cfg["model"],
+            }
+        )
+
+    return configs
+
+
+def maybe_download_sequence_datasets_from_s3_prefix(
+    sequence_data_dir: Path,
+    sequence_data_s3_prefix: str,
+    configs: list[dict],
+) -> Path:
+    """
+    Скачивает sequence datasets из MinIO/S3, если их нет локально.
+
+    Expected remote layout:
+        <prefix>/<task>/<version>/examples.parquet
+        <prefix>/<task>/<version>/vocab.json
+    """
+    required_pairs = sorted({(cfg["task"], cfg["version"]) for cfg in configs})
+
+    expected_files = []
+    for task, version in required_pairs:
+        expected_files.append(sequence_data_dir / task / version / "examples.parquet")
+        expected_files.append(sequence_data_dir / task / version / "vocab.json")
+
+    if all(p.exists() for p in expected_files):
+        print(f"Using local sequence datasets: {sequence_data_dir}")
+        return sequence_data_dir
+
+    if not sequence_data_s3_prefix:
+        missing = [str(p) for p in expected_files if not p.exists()]
+        raise FileNotFoundError(
+            "Sequence dataset files are missing locally and --sequence-data-s3-prefix is not provided. "
+            f"Missing files: {missing[:20]}"
+        )
+
+    from clearml import StorageManager
+
+    prefix = sequence_data_s3_prefix.rstrip("/")
+
+    for task, version in required_pairs:
+        local_dir = sequence_data_dir / task / version
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        for fname in ["examples.parquet", "vocab.json"]:
+            dst = local_dir / fname
+
+            if dst.exists():
+                print(f"Already exists locally: {dst}")
+                continue
+
+            remote_url = f"{prefix}/{task}/{version}/{fname}"
+            print(f"Downloading {remote_url}")
+
+            local_copy = Path(StorageManager.get_local_copy(remote_url=remote_url))
+
+            if not local_copy.exists():
+                raise FileNotFoundError(f"StorageManager returned missing local file: {local_copy}")
+
+            print(f"Copying {local_copy} -> {dst}")
+            shutil.copy2(local_copy, dst)
+
+    return sequence_data_dir
+
+
+def find_checkpoint(
+    ckpt_dir: Path,
+    task: str,
+    version: str,
+    model_name: str,
+    seed: int | None = None,
+) -> Path:
+    """
+    Flexible checkpoint lookup.
+
+    Supports:
+    1) task__version__model__seed42.pt
+    2) task__version__model.pt
+    3) recursive search inside ckpt_dir
+    """
+    candidates = []
+
+    if seed is not None:
+        candidates.append(
+            ckpt_dir / f"{task}__{version}__{model_name}__seed{seed}.pt"
+        )
+
+    candidates.append(
+        ckpt_dir / f"{task}__{version}__{model_name}.pt"
+    )
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    recursive_patterns = []
+
+    if seed is not None:
+        recursive_patterns.append(
+            f"**/{task}__{version}__{model_name}__seed{seed}.pt"
+        )
+
+    recursive_patterns.append(
+        f"**/{task}__{version}__{model_name}.pt"
+    )
+
+    matches = []
+
+    for pattern in recursive_patterns:
+        matches.extend(sorted(ckpt_dir.glob(pattern)))
+
+    matches = list(dict.fromkeys(matches))
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if len(matches) > 1:
+        raise ValueError(
+            "Found multiple matching checkpoints:\n"
+            + "\n".join(str(x) for x in matches)
+            + "\nPlease pass a more specific checkpoint directory."
+        )
+
+    raise FileNotFoundError(
+        f"Checkpoint not found for task={task}, version={version}, model={model_name}, seed={seed}. "
+        f"Searched inside: {ckpt_dir}"
+    )
+
+
+def maybe_download_checkpoints_from_s3_prefix(
+    checkpoint_dir: Path,
+    checkpoint_s3_prefix: str,
+    configs: list[dict],
+    seeds: list[int],
+) -> Path:
+    """
+    Скачивает выбранные checkpoints из MinIO/S3, если их нет локально.
+
+    Expected remote layout:
+        <checkpoint_s3_prefix>/<task>__<version>__<model>__seed<seed>.pt
+
+    Example:
+        guo_icu__raw__GRU_2L_numeric__seed42.pt
+    """
+    expected_files = []
+
+    for cfg in configs:
+        for seed in seeds:
+            expected_files.append(
+                checkpoint_dir / f"{cfg['task']}__{cfg['version']}__{cfg['model']}__seed{seed}.pt"
+            )
+
+    locally_ok = True
+
+    for cfg in configs:
+        for seed in seeds:
+            try:
+                find_checkpoint(
+                    ckpt_dir=checkpoint_dir,
+                    task=cfg["task"],
+                    version=cfg["version"],
+                    model_name=cfg["model"],
+                    seed=seed,
+                )
+            except FileNotFoundError:
+                locally_ok = False
+                break
+
+        if not locally_ok:
+            break
+
+    if locally_ok:
+        print(f"Using local checkpoints: {checkpoint_dir}")
+        return checkpoint_dir
+
+    if not checkpoint_s3_prefix:
+        missing = [str(p) for p in expected_files if not p.exists()]
+        raise FileNotFoundError(
+            "Checkpoint files are missing locally and checkpoint S3 prefix is not provided. "
+            f"Missing files: {missing[:20]}"
+        )
+
+    from clearml import StorageManager
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    prefix = checkpoint_s3_prefix.rstrip("/")
+
+    seen_remote = set()
+
+    for cfg in configs:
+        for seed in seeds:
+            fname = f"{cfg['task']}__{cfg['version']}__{cfg['model']}__seed{seed}.pt"
+            dst = checkpoint_dir / fname
+
+            if dst.exists():
+                print(f"Already exists locally: {dst}")
+                continue
+
+            remote_url = f"{prefix}/{fname}"
+
+            if remote_url in seen_remote:
+                continue
+
+            seen_remote.add(remote_url)
+
+            print(f"Downloading {remote_url}")
+
+            local_copy = Path(StorageManager.get_local_copy(remote_url=remote_url))
+
+            if not local_copy.exists():
+                raise FileNotFoundError(f"StorageManager returned missing local file: {local_copy}")
+
+            print(f"Copying {local_copy} -> {dst}")
+            shutil.copy2(local_copy, dst)
+
+    return checkpoint_dir
 
 
 def make_tabular_scores(
@@ -151,11 +519,11 @@ def make_tabular_scores(
     top_n_numeric_codes: int,
 ) -> pd.DataFrame:
     """
-    Trains tabular baseline on train split and returns raw scores for tuning + held_out.
+    Обучает tabular baseline на train split и возвращает raw scores для tuning + held_out.
 
-    Important:
-    - We do not Platt-calibrate here.
-    - Fusion LogisticRegression itself learns calibration/fusion on tuning.
+    Важно:
+    - здесь не делаем Platt calibration;
+    - fusion LogisticRegression сама учится на tuning.
     """
     set_global_seed(seed)
 
@@ -206,69 +574,6 @@ def make_tabular_scores(
     return pd.concat(frames, ignore_index=True)
 
 
-def find_checkpoint(
-    ckpt_dir: Path,
-    task: str,
-    version: str,
-    model_name: str,
-    seed: int | None = None,
-) -> Path:
-    """
-    Flexible checkpoint lookup.
-
-    Supports:
-    1) task__version__model__seed42.pt
-    2) task__version__model.pt
-    3) recursive search inside ckpt_dir
-    """
-    candidates = []
-
-    if seed is not None:
-        candidates.append(
-            ckpt_dir / f"{task}__{version}__{model_name}__seed{seed}.pt"
-        )
-
-    candidates.append(
-        ckpt_dir / f"{task}__{version}__{model_name}.pt"
-    )
-
-    for path in candidates:
-        if path.exists():
-            return path
-
-    recursive_patterns = []
-
-    if seed is not None:
-        recursive_patterns.append(
-            f"**/{task}__{version}__{model_name}__seed{seed}.pt"
-        )
-
-    recursive_patterns.append(
-        f"**/{task}__{version}__{model_name}.pt"
-    )
-
-    matches = []
-    for pattern in recursive_patterns:
-        matches.extend(sorted(ckpt_dir.glob(pattern)))
-
-    matches = list(dict.fromkeys(matches))
-
-    if len(matches) == 1:
-        return matches[0]
-
-    if len(matches) > 1:
-        raise ValueError(
-            "Found multiple matching checkpoints:\n"
-            + "\n".join(str(x) for x in matches)
-            + "\nPlease pass a more specific checkpoint directory."
-        )
-
-    raise FileNotFoundError(
-        f"Checkpoint not found for task={task}, version={version}, model={model_name}, seed={seed}. "
-        f"Searched inside: {ckpt_dir}"
-    )
-
-
 def make_sequence_scores(
     sequence_data_dir: Path,
     checkpoint_dir: Path,
@@ -281,8 +586,8 @@ def make_sequence_scores(
     num_workers: int,
 ) -> pd.DataFrame:
     """
-    Loads a code-only sequence checkpoint and returns raw sigmoid scores
-    for tuning + held_out.
+    Загружает code-only sequence checkpoint и возвращает raw sigmoid scores
+    для tuning + held_out.
     """
     set_global_seed(seed)
 
@@ -293,15 +598,19 @@ def make_sequence_scores(
         model_name=model_name,
         seed=seed,
     )
+
     if not ckpt_file.exists():
         raise FileNotFoundError(f"Sequence checkpoint not found: {ckpt_file}")
+
+    print(f"Loading sequence checkpoint: {ckpt_file}")
 
     ckpt = safe_torch_load(ckpt_file, device)
 
     df = seq_mod.load_sequence_examples(sequence_data_dir, task, version)
     vocab = seq_mod.load_vocab(sequence_data_dir, task, version)
 
-    max_len = int(ckpt.get("max_len", 512))
+    max_len = int(ckpt.get("max_len", 4096))
+
     loaders = seq_mod.make_loaders(
         df=df,
         batch_size=batch_size,
@@ -350,8 +659,8 @@ def make_numeric_sequence_scores(
     num_workers: int,
 ) -> pd.DataFrame:
     """
-    Loads a numeric-aware sequence checkpoint and returns raw sigmoid scores
-    for tuning + held_out.
+    Загружает numeric-aware sequence checkpoint и возвращает raw sigmoid scores
+    для tuning + held_out.
     """
     set_global_seed(seed)
 
@@ -362,15 +671,18 @@ def make_numeric_sequence_scores(
         model_name=model_name,
         seed=seed,
     )
+
     if not ckpt_file.exists():
         raise FileNotFoundError(f"Numeric sequence checkpoint not found: {ckpt_file}")
+
+    print(f"Loading numeric sequence checkpoint: {ckpt_file}")
 
     ckpt = safe_torch_load(ckpt_file, device)
 
     df = numseq_mod.load_sequence_examples(sequence_data_dir, task, version)
     vocab = numseq_mod.load_vocab(sequence_data_dir, task, version)
 
-    max_len = int(ckpt.get("max_len", 1024))
+    max_len = int(ckpt.get("max_len", 4096))
 
     if "token_numeric_mean" in ckpt and "token_numeric_std" in ckpt:
         token_mean = np.asarray(ckpt["token_numeric_mean"], dtype=np.float32)
@@ -683,11 +995,147 @@ def run_ensemble_fusion(
     return pd.DataFrame(metric_rows), pd.concat(pred_rows, ignore_index=True)
 
 
+def is_clearml_agent_run() -> bool:
+    return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("TRAINS_TASK_ID"))
+
+
+def build_clearml_config(args) -> dict:
+    config = vars(args).copy()
+
+    for key in [
+        "cache_dir",
+        "sequence_data_dir",
+        "sequence_checkpoint_dir",
+        "numeric_checkpoint_dir",
+        "output_dir",
+    ]:
+        if key in config:
+            config[key] = str(config[key])
+
+    return config
+
+
+def sync_args_from_clearml_config(args, config: dict) -> None:
+    path_keys = {
+        "cache_dir",
+        "sequence_data_dir",
+        "sequence_checkpoint_dir",
+        "numeric_checkpoint_dir",
+        "output_dir",
+    }
+
+    int_keys = {
+        "top_n_codes",
+        "top_n_numeric_codes",
+        "batch_size_sequence",
+        "batch_size_numeric",
+        "num_workers",
+    }
+
+    skip_keys = {"enable_clearml", "execute_remotely"}
+
+    for key, value in config.items():
+        if key in skip_keys:
+            continue
+
+        if not hasattr(args, key):
+            continue
+
+        if key in path_keys:
+            setattr(args, key, Path(value))
+        elif key in int_keys:
+            setattr(args, key, int(value))
+        else:
+            setattr(args, key, value)
+
+
+def maybe_init_clearml(args, config: dict):
+    remote_agent_run = is_clearml_agent_run()
+
+    if not args.enable_clearml and not remote_agent_run:
+        return None, config
+
+    from clearml import Task
+
+    if not remote_agent_run:
+        Task.force_requirements_env_freeze(False, "requirements.txt")
+
+    should_execute_remotely = args.execute_remotely and not remote_agent_run
+
+    if remote_agent_run:
+        task = Task.current_task()
+
+        if task is None:
+            task = Task.init(
+                project_name=args.clearml_project,
+                task_name=args.clearml_task_name,
+                output_uri=args.clearml_output_uri or None,
+                auto_connect_arg_parser=False,
+            )
+    else:
+        task = Task.init(
+            project_name=args.clearml_project,
+            task_name=args.clearml_task_name,
+            output_uri=args.clearml_output_uri or None,
+            auto_connect_arg_parser=False,
+        )
+
+    connected_config = task.connect(config)
+    connected_config = dict(connected_config)
+    sync_args_from_clearml_config(args, connected_config)
+
+    print("Resolved ClearML parameters:")
+    print(f"  remote_agent_run = {remote_agent_run}")
+    print(f"  sequence_config = {args.sequence_config}")
+    print(f"  seeds = {args.seeds}")
+    print(f"  tasks = {args.tasks}")
+    print(f"  cache_dir = {args.cache_dir}")
+    print(f"  cache_s3_prefix = {args.cache_s3_prefix}")
+    print(f"  sequence_data_dir = {args.sequence_data_dir}")
+    print(f"  sequence_data_s3_prefix = {args.sequence_data_s3_prefix}")
+    print(f"  checkpoint_s3_prefix = {args.checkpoint_s3_prefix}")
+    print(f"  sequence_checkpoint_s3_prefix = {args.sequence_checkpoint_s3_prefix}")
+    print(f"  numeric_checkpoint_s3_prefix = {args.numeric_checkpoint_s3_prefix}")
+    print(f"  output_dir = {args.output_dir}")
+    print(f"  device = {args.device}")
+    print(f"  clearml_queue = {args.clearml_queue}")
+
+    if should_execute_remotely:
+        print(f"Enqueueing ClearML task to queue: {args.clearml_queue}")
+        task.execute_remotely(
+            queue_name=args.clearml_queue,
+            exit_process=True,
+        )
+
+    return task, connected_config
+
+
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--cache-dir", type=Path, default=Path("ehrshot_baseline_cache"))
-    parser.add_argument("--sequence-data-dir", type=Path, default=Path("ehrshot_sequence_datasets"))
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path("ehrshot_baseline_cache"),
+    )
+    parser.add_argument(
+        "--cache-s3-prefix",
+        type=str,
+        default="",
+        help="MinIO/S3 prefix with tabular cache parquet files.",
+    )
+
+    parser.add_argument(
+        "--sequence-data-dir",
+        type=Path,
+        default=Path("ehrshot_sequence_datasets"),
+    )
+    parser.add_argument(
+        "--sequence-data-s3-prefix",
+        type=str,
+        default="",
+        help="MinIO/S3 prefix with sequence datasets.",
+    )
 
     parser.add_argument(
         "--sequence-checkpoint-dir",
@@ -700,10 +1148,48 @@ def main():
         default=Path("ehrshot_multiseed_numeric_sequence_results/checkpoints"),
     )
 
-    parser.add_argument("--output-dir", type=Path, default=Path("ehrshot_score_fusion_minimal"))
+    parser.add_argument(
+        "--checkpoint-s3-prefix",
+        type=str,
+        default="",
+        help="Common MinIO/S3 prefix with all sequence and numeric checkpoints.",
+    )
+    parser.add_argument(
+        "--sequence-checkpoint-s3-prefix",
+        type=str,
+        default="",
+        help="MinIO/S3 prefix with code-only sequence checkpoints. If empty, --checkpoint-s3-prefix is used.",
+    )
+    parser.add_argument(
+        "--numeric-checkpoint-s3-prefix",
+        type=str,
+        default="",
+        help="MinIO/S3 prefix with numeric sequence checkpoints. If empty, --checkpoint-s3-prefix is used.",
+    )
 
-    parser.add_argument("--seeds", type=str, default="42,43,44,45,46")
-    parser.add_argument("--tasks", type=str, default="guo_readmission,guo_icu")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("ehrshot_score_fusion_minimal"),
+    )
+
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default="42,43,44,45,46",
+    )
+    parser.add_argument(
+        "--tasks",
+        type=str,
+        default="guo_readmission,guo_icu",
+    )
+    parser.add_argument(
+        "--sequence-config",
+        type=str,
+        default="raw",
+        choices=["raw", "best"],
+        help="Which sequence checkpoints to fuse: raw or previously selected best compressed configs.",
+    )
 
     parser.add_argument("--top-n-codes", type=int, default=500)
     parser.add_argument("--top-n-numeric-codes", type=int, default=40)
@@ -729,7 +1215,35 @@ def main():
         help="Class weight for meta LogisticRegression.",
     )
 
+    parser.add_argument("--enable-clearml", action="store_true")
+    parser.add_argument(
+        "--execute-remotely",
+        action="store_true",
+        help="If set, enqueue this ClearML task to an agent queue and stop local execution.",
+    )
+    parser.add_argument("--clearml-queue", type=str, default="gpu_40")
+    parser.add_argument(
+        "--clearml-project",
+        type=str,
+        default="pershin-medailab/EHR_Risk_Profiling/EHRSHOT",
+    )
+    parser.add_argument(
+        "--clearml-task-name",
+        type=str,
+        default="score_fusion_minimal_raw",
+    )
+    parser.add_argument(
+        "--clearml-output-uri",
+        type=str,
+        default="s3://api.blackhole2.ai.innopolis.university:443/pershin-medailab",
+    )
+
     args = parser.parse_args()
+
+    config = build_clearml_config(args)
+    config["task_configs"] = TASK_CONFIG_PRESETS[args.sequence_config]
+
+    clearml_task, config = maybe_init_clearml(args, config)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -738,20 +1252,56 @@ def main():
     device = get_device(args.device)
 
     class_weight = None if args.class_weight == "none" else "balanced"
+    task_configs = TASK_CONFIG_PRESETS[args.sequence_config]
 
     print("DEVICE:", device)
     print("TASKS:", tasks)
     print("SEEDS:", seeds)
     print("score_transform:", args.score_transform)
     print("class_weight:", class_weight)
+    print("sequence_config:", args.sequence_config)
+
+    for task in tasks:
+        if task not in task_configs:
+            raise ValueError(f"Unknown task={task}. Available: {list(task_configs)}")
+
+    args.cache_dir = maybe_download_tabular_cache_from_s3_prefix(
+        cache_dir=args.cache_dir,
+        cache_s3_prefix=args.cache_s3_prefix,
+        tasks=tasks,
+        top_n_codes=args.top_n_codes,
+        top_n_numeric_codes=args.top_n_numeric_codes,
+    )
+
+    dataset_configs = required_sequence_dataset_configs(task_configs, tasks)
+
+    args.sequence_data_dir = maybe_download_sequence_datasets_from_s3_prefix(
+        sequence_data_dir=args.sequence_data_dir,
+        sequence_data_s3_prefix=args.sequence_data_s3_prefix,
+        configs=dataset_configs,
+    )
+
+    sequence_ckpt_prefix = args.sequence_checkpoint_s3_prefix or args.checkpoint_s3_prefix
+    numeric_ckpt_prefix = args.numeric_checkpoint_s3_prefix or args.checkpoint_s3_prefix
+
+    args.sequence_checkpoint_dir = maybe_download_checkpoints_from_s3_prefix(
+        checkpoint_dir=args.sequence_checkpoint_dir,
+        checkpoint_s3_prefix=sequence_ckpt_prefix,
+        configs=required_checkpoint_configs(task_configs, tasks, role="sequence"),
+        seeds=seeds,
+    )
+
+    args.numeric_checkpoint_dir = maybe_download_checkpoints_from_s3_prefix(
+        checkpoint_dir=args.numeric_checkpoint_dir,
+        checkpoint_s3_prefix=numeric_ckpt_prefix,
+        configs=required_checkpoint_configs(task_configs, tasks, role="numeric_sequence"),
+        seeds=seeds,
+    )
 
     all_base_scores = []
 
     for task in tasks:
-        if task not in TASK_CONFIGS:
-            raise ValueError(f"Unknown task={task}. Available: {list(TASK_CONFIGS)}")
-
-        cfg = TASK_CONFIGS[task]
+        cfg = task_configs[task]
 
         for seed in seeds:
             print("=" * 100)
@@ -813,9 +1363,6 @@ def main():
         .reset_index()
     )
 
-    # ------------------------------------------------------------
-    # 1. Per-seed fusion
-    # ------------------------------------------------------------
     single_metric_parts = []
     single_pred_parts = []
 
@@ -840,9 +1387,6 @@ def main():
     seed_summary = summarize_single_seed_metrics(single_metrics)
     seed_summary.to_csv(args.output_dir / "fusion_seed_summary.csv", index=False)
 
-    # ------------------------------------------------------------
-    # 2. Ensemble-over-seeds fusion
-    # ------------------------------------------------------------
     ensemble_scores = make_ensemble_base_scores(base_scores)
     ensemble_scores.to_csv(args.output_dir / "ensemble_base_scores_tuning_heldout.csv", index=False)
 
@@ -868,6 +1412,7 @@ def main():
     print("\nSaved outputs to:", args.output_dir)
 
     print("\nSingle-seed summary sorted by AUPRC:")
+
     cols = [
         "task",
         "variant",
@@ -879,6 +1424,7 @@ def main():
         "logloss__mean",
         "top_10pct_precision__mean",
     ]
+
     print(
         seed_summary[cols]
         .sort_values(["task", "auprc__mean"], ascending=[True, False])
@@ -886,6 +1432,7 @@ def main():
     )
 
     print("\nEnsemble fusion metrics sorted by AUPRC:")
+
     cols = [
         "task",
         "variant",
@@ -897,11 +1444,21 @@ def main():
         "n",
         "n_positive",
     ]
+
     print(
         ensemble_metrics[cols]
         .sort_values(["task", "auprc"], ascending=[True, False])
         .to_string(index=False)
     )
+
+    if clearml_task is not None:
+        clearml_task.upload_artifact("base_scores_tuning_heldout", base_scores)
+        clearml_task.upload_artifact("fusion_single_seed_metrics", single_metrics)
+        clearml_task.upload_artifact("fusion_single_seed_predictions", single_predictions)
+        clearml_task.upload_artifact("fusion_seed_summary", seed_summary)
+        clearml_task.upload_artifact("ensemble_base_scores_tuning_heldout", ensemble_scores)
+        clearml_task.upload_artifact("fusion_ensemble_metrics", ensemble_metrics)
+        clearml_task.upload_artifact("fusion_ensemble_predictions", ensemble_predictions)
 
 
 if __name__ == "__main__":

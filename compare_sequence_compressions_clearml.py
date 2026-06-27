@@ -43,7 +43,7 @@ DEFAULT_OUTPUT_URI = "s3://api.blackhole2.ai.innopolis.university:443/pershin-me
 DEFAULT_SEQUENCE_S3_PREFIX = (
     "s3://api.blackhole2.ai.innopolis.university:443/"
     "pershin-medailab/pershin-medailab/EHR_Risk_Profiling/EHRSHOT/"
-    "ehrshot_sequence_datasets_compression"
+    "ehrshot_multiseed_inputs/ehrshot_sequence_datasets"
 )
 
 DEFAULT_GRID_RESULTS_S3_PREFIX = (
