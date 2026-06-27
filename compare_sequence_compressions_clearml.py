@@ -43,9 +43,14 @@ DEFAULT_OUTPUT_URI = "s3://api.blackhole2.ai.innopolis.university:443/pershin-me
 DEFAULT_SEQUENCE_S3_PREFIX = (
     "s3://api.blackhole2.ai.innopolis.university:443/"
     "pershin-medailab/pershin-medailab/EHR_Risk_Profiling/EHRSHOT/"
-    "ehrshot_multiseed_inputs/ehrshot_sequence_datasets_compression_v2"
+    "ehrshot_sequence_datasets_compression"
 )
 
+DEFAULT_GRID_RESULTS_S3_PREFIX = (
+    "s3://api.blackhole2.ai.innopolis.university:443/"
+    "pershin-medailab/pershin-medailab/EHR_Risk_Profiling/EHRSHOT/"
+    "ehrshot_sequence_compression_grid_results"
+)
 
 def parse_csv_list(x: str | Sequence[str]) -> list[str]:
     if isinstance(x, (list, tuple)):
@@ -61,6 +66,12 @@ def parse_args() -> argparse.Namespace:
 
     # Where to save downloaded predictions and comparison outputs.
     parser.add_argument("--results-dir", type=Path, default=Path("ehrshot_sequence_compression_results_v2"))
+    parser.add_argument(
+        "--grid-results-s3-prefix",
+        type=str,
+        default=DEFAULT_GRID_RESULTS_S3_PREFIX,
+        help="S3/MinIO prefix with grid_all_heldout_predictions.csv from one-task grid training.",
+    )
     parser.add_argument("--sequence-dir", type=Path, default=Path("ehrshot_sequence_datasets_compression_v2"))
     parser.add_argument("--output-dir", type=Path, default=Path("ehrshot_sequence_compression_comparison_v2"))
 
@@ -182,6 +193,8 @@ def maybe_init_clearml(args: argparse.Namespace):
     print(f"  sequence_dir = {args.sequence_dir}")
     print(f"  output_dir = {args.output_dir}")
     print(f"  clearml_queue = {args.clearml_queue}")
+    print(f"  grid_results_s3_prefix = {args.grid_results_s3_prefix}")
+    print(f"  sequence_data_s3_prefix = {args.sequence_data_s3_prefix}")
 
     if args.execute_remotely and not remote_agent_run:
         print(f"Enqueueing comparison task to queue: {args.clearml_queue}")
@@ -189,6 +202,62 @@ def maybe_init_clearml(args: argparse.Namespace):
 
     return task
 
+GRID_RESULT_FILES = [
+    "grid_run_plan.csv",
+    "grid_all_heldout_predictions.csv",
+    "grid_all_metrics.csv",
+    "grid_all_topk.csv",
+    "grid_all_history.csv",
+]
+
+
+def maybe_download_grid_results_from_s3(args: argparse.Namespace) -> None:
+    """
+    Download outputs produced by train_sequence_compression_grid_clearml.py.
+
+    This is the new workflow:
+    one ClearML task trains all runs and uploads grid_all_*.csv files to MinIO.
+    """
+    if not args.grid_results_s3_prefix:
+        print("No --grid-results-s3-prefix provided; using local results_dir only.")
+        return
+
+    from clearml import StorageManager
+
+    args.results_dir.mkdir(parents=True, exist_ok=True)
+    prefix = args.grid_results_s3_prefix.rstrip("/")
+
+    for fname in GRID_RESULT_FILES:
+        dst = args.results_dir / fname
+
+        if dst.exists():
+            print(f"Using local grid result: {dst}")
+            continue
+
+        remote_url = f"{prefix}/{fname}"
+        print(f"Downloading grid result: {remote_url}")
+
+        try:
+            local_copy = Path(StorageManager.get_local_copy(remote_url=remote_url))
+
+            if local_copy.is_file():
+                shutil.copy2(local_copy, dst)
+            elif local_copy.is_dir():
+                matches = sorted(local_copy.rglob(fname))
+                if len(matches) == 1:
+                    shutil.copy2(matches[0], dst)
+                else:
+                    raise FileNotFoundError(f"Could not find {fname} inside {local_copy}")
+            else:
+                raise FileNotFoundError(f"StorageManager returned missing path: {local_copy}")
+
+        except Exception as e:
+            if fname == "grid_all_heldout_predictions.csv":
+                raise RuntimeError(
+                    f"Cannot download required predictions file: {remote_url}"
+                ) from e
+
+            print(f"WARNING: optional grid result was not downloaded: {fname} | {e!r}")
 
 # -----------------------------
 # Metrics
@@ -377,28 +446,90 @@ def download_predictions_from_clearml(args: argparse.Namespace) -> pd.DataFrame:
 
 
 def load_predictions_from_local(results_dir: Path, calibration: str) -> pd.DataFrame:
-    files = sorted(results_dir.glob("*__heldout_predictions.csv"))
-    files += sorted(results_dir.glob("all_heldout_predictions.csv"))
-    files = list(dict.fromkeys(files))
+    """
+    Load predictions from local results_dir.
+
+    New preferred input:
+        grid_all_heldout_predictions.csv
+
+    Backward-compatible inputs:
+        *__heldout_predictions.csv
+        all_heldout_predictions.csv
+    """
+    grid_path = results_dir / "grid_all_heldout_predictions.csv"
+
+    if grid_path.exists():
+        files = [grid_path]
+    else:
+        files = sorted(results_dir.glob("*__heldout_predictions.csv"))
+        files += sorted(results_dir.glob("all_heldout_predictions.csv"))
+        files = list(dict.fromkeys(files))
+
     if not files:
-        raise FileNotFoundError(f"No prediction csv files found in {results_dir}")
+        raise FileNotFoundError(
+            f"No prediction csv files found in {results_dir}. "
+            "Expected grid_all_heldout_predictions.csv or *__heldout_predictions.csv"
+        )
+
     parts = []
+
     for path in files:
         df = pd.read_csv(path)
         df["source_file"] = str(path)
         parts.append(df)
+        print(f"Loaded predictions: {path} shape={df.shape}")
+
     pred = pd.concat(parts, ignore_index=True)
-    needed = {"task", "version", "model", "seed", "calibration", "row_id", "subject_id", "y_true", "risk"}
+
+    needed = {
+        "task",
+        "version",
+        "model",
+        "seed",
+        "calibration",
+        "row_id",
+        "subject_id",
+        "y_true",
+        "risk",
+    }
     missing = needed - set(pred.columns)
+
     if missing:
         raise ValueError(f"Missing columns in prediction files: {missing}")
+
+    # If future version stores both tuning and held_out in one file, keep held_out here.
+    if "split" in pred.columns:
+        pred = pred[pred["split"] == "held_out"].copy()
+
     if calibration != "all":
         pred = pred[pred["calibration"] == calibration].copy()
-    pred["row_id"] = pred["row_id"].astype(int)
-    pred["subject_id"] = pred["subject_id"].astype(int)
-    pred["y_true"] = pred["y_true"].astype(int)
-    pred["seed"] = pred["seed"].astype(int)
+
+    for col in ["seed", "row_id", "subject_id", "y_true"]:
+        pred[col] = pred[col].astype(int)
+
     pred["risk"] = pred["risk"].astype(float)
+
+    dedup_key = [
+        "task",
+        "version",
+        "model",
+        "seed",
+        "calibration",
+        "row_id",
+        "subject_id",
+    ]
+
+    n_before = len(pred)
+    pred = pred.drop_duplicates(subset=dedup_key, keep="last").copy()
+    n_after = len(pred)
+
+    if n_before != n_after:
+        print(f"Dropped duplicate prediction rows: {n_before - n_after}")
+
+    out_path = results_dir / "all_heldout_predictions.csv"
+    pred.to_csv(out_path, index=False)
+    print(f"Saved filtered/deduped predictions: {out_path}")
+
     return pred.reset_index(drop=True)
 
 
@@ -451,89 +582,108 @@ def load_examples(sequence_dir: Path, task: str, version: str) -> pd.DataFrame |
 
 
 def build_high_repeat_group(sequence_dir: Path, tasks: list[str], baseline_version: str, q: float) -> pd.DataFrame:
+    """
+    Define high-repeat held-out examples as top-q by amount of events removed
+    by compressed_first_last.
+
+    This matches our current dataset format:
+        compressed_first_last/examples.parquet has n_events_removed_vs_raw.
+    """
     rows = []
+
     for task in tasks:
         raw = load_examples(sequence_dir, task, baseline_version)
         first_last = load_examples(sequence_dir, task, "compressed_first_last")
+
         if raw is None:
             print(f"WARNING: raw examples not found for {task}; high-repeat group will be unavailable")
             continue
-        raw_cols = ["row_id", "subject_id", "split", "label", "seq_len"]
-        if "n_compressible_chronic_events" in raw.columns:
-            raw_cols.append("n_compressible_chronic_events")
-        raw_small = raw[raw_cols].copy()
-        raw_small = raw_small[raw_small["split"] == "held_out"].copy()
 
-        if (
-            first_last is not None
-            and "n_compressible_chronic_events" in first_last.columns
-            and "n_compressible_chronic_events" in raw_small.columns
-        ):
-            fl = first_last[["row_id", "subject_id", "n_compressible_chronic_events", "seq_len"]].rename(columns={
-                "n_compressible_chronic_events": "first_last_n_compressible_chronic_events",
-                "seq_len": "first_last_seq_len",
-            })
-            tmp = raw_small.merge(fl, on=["row_id", "subject_id"], how="left")
-            tmp["repeat_removed_proxy"] = tmp["n_compressible_chronic_events"] - tmp["first_last_n_compressible_chronic_events"].fillna(tmp["n_compressible_chronic_events"])
+        raw_small = raw[
+            ["row_id", "subject_id", "split", "label", "seq_len"]
+        ].copy()
+
+        raw_small = raw_small[raw_small["split"] == "held_out"].copy()
+        raw_small = raw_small.rename(columns={"seq_len": "raw_seq_len"})
+
+        if first_last is not None:
+            fl_cols = ["row_id", "subject_id", "split", "seq_len"]
+
+            if "n_events_removed_vs_raw" in first_last.columns:
+                fl_cols.append("n_events_removed_vs_raw")
+
+            fl = first_last[fl_cols].copy()
+            fl = fl[fl["split"] == "held_out"].copy()
+            fl = fl.rename(
+                columns={
+                    "seq_len": "first_last_seq_len",
+                    "n_events_removed_vs_raw": "first_last_events_removed_vs_raw",
+                }
+            )
+
+            tmp = raw_small.merge(
+                fl,
+                on=["row_id", "subject_id", "split"],
+                how="left",
+                validate="one_to_one",
+            )
+
+            if "first_last_events_removed_vs_raw" in tmp.columns:
+                tmp["repeat_removed_proxy"] = tmp["first_last_events_removed_vs_raw"].fillna(0)
+            else:
+                tmp["repeat_removed_proxy"] = (
+                    tmp["raw_seq_len"] - tmp["first_last_seq_len"]
+                ).fillna(0)
         else:
             tmp = raw_small.copy()
-            tmp["repeat_removed_proxy"] = tmp["seq_len"]
+            tmp["repeat_removed_proxy"] = 0.0
 
         threshold = float(np.quantile(tmp["repeat_removed_proxy"], q)) if len(tmp) else np.nan
+
         tmp["high_repeat_group"] = tmp["repeat_removed_proxy"] >= threshold
         tmp["high_repeat_threshold"] = threshold
         tmp["task"] = task
-        rows.append(tmp[["task", "row_id", "subject_id", "label", "repeat_removed_proxy", "high_repeat_group", "high_repeat_threshold"]])
+
+        rows.append(
+            tmp[
+                [
+                    "task",
+                    "row_id",
+                    "subject_id",
+                    "label",
+                    "repeat_removed_proxy",
+                    "high_repeat_group",
+                    "high_repeat_threshold",
+                ]
+            ]
+        )
+
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
 def build_sequence_cost_summary(sequence_dir: Path, tasks: list[str], high_repeat_df: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Build cost table for each compression version.
+    """
+    Build cost table for each compression version using audit columns already saved
+    in examples.parquet.
 
-    Robustness note:
-    Some cached examples already contain helper columns such as raw_seq_len or
-    events_removed_vs_raw. If we merge them as-is with raw_small, pandas may add
-    suffixes (_x/_y), and the expected raw_seq_len column disappears. Therefore
-    we drop stale helper columns before merging and compute the cost columns fresh.
+    Expected new columns:
+        seq_len
+        raw_seq_len
+        n_events_removed_vs_raw
+        n_synthetic_events
+        n_compressible_chronic_events_raw
     """
     rows = []
+
     if not sequence_dir.exists():
         return pd.DataFrame(rows)
 
-    stale_cost_cols = {
-        "raw_seq_len",
-        "raw_n_diagnosis_like_events",
-        "raw_n_compressible_chronic_events",
-        "events_removed_vs_raw",
-        "diagnosis_like_removed_vs_raw",
-        "compressible_chronic_removed_vs_raw",
-    }
+    for task in tasks:
+        task_dir = sequence_dir / task
 
-    for task_dir in sorted(sequence_dir.iterdir()):
-        if not task_dir.is_dir() or task_dir.name not in tasks:
+        if not task_dir.exists():
+            print(f"WARNING: sequence task dir not found: {task_dir}")
             continue
-
-        task = task_dir.name
-        raw = load_examples(sequence_dir, task, "raw")
-        if raw is None or "seq_len" not in raw.columns:
-            print(f"WARNING: cannot build cost summary for task={task}: missing raw examples or seq_len")
-            continue
-
-        raw_cols = ["row_id", "subject_id", "split", "seq_len"]
-        if "n_diagnosis_like_events" in raw.columns:
-            raw_cols.append("n_diagnosis_like_events")
-        if "n_compressible_chronic_events" in raw.columns:
-            raw_cols.append("n_compressible_chronic_events")
-
-        raw_small = raw[raw_cols].copy().rename(columns={
-            "seq_len": "raw_seq_len",
-            "n_diagnosis_like_events": "raw_n_diagnosis_like_events",
-            "n_compressible_chronic_events": "raw_n_compressible_chronic_events",
-        })
-
-        # One row per prediction example. If duplicates ever appear, keep first
-        # to avoid accidental many-to-many merge explosion.
-        raw_small = raw_small.drop_duplicates(subset=["row_id", "subject_id", "split"])
 
         for version_dir in sorted(task_dir.iterdir()):
             if not version_dir.is_dir():
@@ -541,51 +691,58 @@ def build_sequence_cost_summary(sequence_dir: Path, tasks: list[str], high_repea
 
             version = version_dir.name
             df = load_examples(sequence_dir, task, version)
+
             if df is None or "seq_len" not in df.columns:
                 print(f"WARNING: skip cost summary task={task} version={version}: missing examples or seq_len")
                 continue
 
-            # Drop stale helper columns from cached datasets so merge creates stable names.
-            df = df.drop(columns=[c for c in stale_cost_cols if c in df.columns], errors="ignore")
+            df = df.copy()
 
-            merged = df.merge(
-                raw_small,
-                on=["row_id", "subject_id", "split"],
-                how="left",
-                validate="many_to_one",
-            )
+            if "raw_seq_len" not in df.columns:
+                if version == "raw":
+                    df["raw_seq_len"] = df["seq_len"]
+                else:
+                    raw = load_examples(sequence_dir, task, "raw")
+                    if raw is None:
+                        print(f"WARNING: raw examples missing for cost summary task={task} version={version}")
+                        continue
 
-            if "raw_seq_len" not in merged.columns:
-                raise KeyError(
-                    f"raw_seq_len missing after merge for task={task}, version={version}. "
-                    f"Columns: {list(merged.columns)[:80]}"
-                )
+                    raw_small = raw[["row_id", "subject_id", "split", "seq_len"]].rename(
+                        columns={"seq_len": "raw_seq_len"}
+                    )
 
-            merged["events_removed_vs_raw"] = merged["raw_seq_len"] - merged["seq_len"]
+                    df = df.merge(
+                        raw_small,
+                        on=["row_id", "subject_id", "split"],
+                        how="left",
+                        validate="many_to_one",
+                    )
 
-            if "raw_n_diagnosis_like_events" in merged.columns and "n_diagnosis_like_events" in merged.columns:
-                merged["diagnosis_like_removed_vs_raw"] = (
-                    merged["raw_n_diagnosis_like_events"] - merged["n_diagnosis_like_events"]
-                )
-            else:
-                merged["diagnosis_like_removed_vs_raw"] = np.nan
+            if "n_events_removed_vs_raw" not in df.columns:
+                df["n_events_removed_vs_raw"] = df["raw_seq_len"] - df["seq_len"]
 
-            if "raw_n_compressible_chronic_events" in merged.columns and "n_compressible_chronic_events" in merged.columns:
-                merged["compressible_chronic_removed_vs_raw"] = (
-                    merged["raw_n_compressible_chronic_events"] - merged["n_compressible_chronic_events"]
-                )
-            else:
-                merged["compressible_chronic_removed_vs_raw"] = np.nan
+            if "n_synthetic_events" not in df.columns:
+                if "n_compression_events" in df.columns:
+                    df["n_synthetic_events"] = df["n_compression_events"]
+                else:
+                    df["n_synthetic_events"] = 0
+
+            if "n_compressible_chronic_events_raw" not in df.columns:
+                df["n_compressible_chronic_events_raw"] = np.nan
 
             split_parts = [
-                ("all", merged),
-                ("held_out", merged[merged["split"] == "held_out"]),
+                ("all", df),
+                ("held_out", df[df["split"] == "held_out"]),
             ]
 
             if high_repeat_df is not None and len(high_repeat_df):
-                h = high_repeat_df[(high_repeat_df["task"] == task) & (high_repeat_df["high_repeat_group"])]
+                h = high_repeat_df[
+                    (high_repeat_df["task"] == task)
+                    & (high_repeat_df["high_repeat_group"])
+                ]
+
                 if len(h):
-                    high_part = merged.merge(
+                    high_part = df.merge(
                         h[["task", "row_id", "subject_id", "high_repeat_group"]],
                         on=["task", "row_id", "subject_id"],
                         how="inner",
@@ -596,29 +753,26 @@ def build_sequence_cost_summary(sequence_dir: Path, tasks: list[str], high_repea
                 if len(part) == 0:
                     continue
 
-                n_compression_events = (
-                    part["n_compression_events"]
-                    if "n_compression_events" in part.columns
-                    else pd.Series(np.zeros(len(part)), index=part.index)
+                rows.append(
+                    {
+                        "task": task,
+                        "version": version,
+                        "split": split_name,
+                        "n_examples": int(len(part)),
+                        "n_patients": int(part["subject_id"].nunique()),
+                        "mean_seq_len": float(part["seq_len"].mean()),
+                        "median_seq_len": float(part["seq_len"].median()),
+                        "p90_seq_len": float(np.quantile(part["seq_len"], 0.90)),
+                        "max_seq_len": int(part["seq_len"].max()),
+                        "mean_events_removed_vs_raw": float(part["n_events_removed_vs_raw"].mean()),
+                        "median_events_removed_vs_raw": float(part["n_events_removed_vs_raw"].median()),
+                        "p90_events_removed_vs_raw": float(np.quantile(part["n_events_removed_vs_raw"], 0.90)),
+                        "mean_synthetic_events": float(part["n_synthetic_events"].mean()),
+                        "mean_compressible_chronic_events_raw": float(
+                            part["n_compressible_chronic_events_raw"].mean()
+                        ),
+                    }
                 )
-
-                rows.append({
-                    "task": task,
-                    "version": version,
-                    "split": split_name,
-                    "n_examples": int(len(part)),
-                    "n_patients": int(part["subject_id"].nunique()),
-                    "mean_seq_len": float(part["seq_len"].mean()),
-                    "median_seq_len": float(part["seq_len"].median()),
-                    "p90_seq_len": float(np.quantile(part["seq_len"], 0.90)),
-                    "max_seq_len": int(part["seq_len"].max()),
-                    "mean_events_removed_vs_raw": float(part["events_removed_vs_raw"].mean()),
-                    "median_events_removed_vs_raw": float(part["events_removed_vs_raw"].median()),
-                    "p90_events_removed_vs_raw": float(np.quantile(part["events_removed_vs_raw"], 0.90)),
-                    "mean_diagnosis_like_removed_vs_raw": float(part["diagnosis_like_removed_vs_raw"].mean()),
-                    "mean_compressible_chronic_removed_vs_raw": float(part["compressible_chronic_removed_vs_raw"].mean()),
-                    "mean_n_compression_events": float(n_compression_events.mean()),
-                })
 
     return pd.DataFrame(rows)
 
@@ -791,8 +945,9 @@ def main() -> None:
     if args.load_from_clearml:
         pred = download_predictions_from_clearml(args)
     else:
-        pred = load_predictions_from_local(args.results_dir, args.calibration)
+        maybe_download_grid_results_from_s3(args)
 
+    pred = load_predictions_from_local(args.results_dir, args.calibration)
     pred = pred[pred["task"].isin(args.tasks)].copy()
     if pred.empty:
         raise ValueError("No predictions left after task/calibration filtering")
