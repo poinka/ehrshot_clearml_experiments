@@ -23,11 +23,7 @@ from common_ehrshot_eval import (
     topk_metrics,
 )
 
-# code-only sequence helpers
-import train_sequence_multiseed as seq_mod
-
-# numeric-aware sequence helpers
-import train_numeric_sequence_multiseed as numseq_mod
+import train_sequence_compression_model_clearml as seq_base
 
 
 META_COLS = {"task", "row_id", "subject_id", "prediction_time", "label", "split"}
@@ -136,6 +132,23 @@ def get_required_local_copy(remote_url: str) -> Path:
         )
 
     return path
+
+def split_model_name_for_seq_base(model_name: str) -> tuple[str, bool]:
+    """
+    File/checkpoint name can be:
+      RETAIN_lite
+      RETAIN_lite_numeric
+      GRU_2L
+      GRU_2L_numeric
+
+    But train_sequence_compression_model_clearml.make_model expects:
+      model = RETAIN_lite / GRU_2L / LSTM_1L ...
+      use_numeric = True/False
+    """
+    if model_name.endswith("_numeric"):
+        return model_name.removesuffix("_numeric"), True
+
+    return model_name, False
 
 def get_device(device_arg: str) -> torch.device:
     if device_arg != "auto":
@@ -606,7 +619,7 @@ def make_tabular_scores(
     return pd.concat(frames, ignore_index=True)
 
 
-def make_sequence_scores(
+def make_compression_sequence_scores(
     sequence_data_dir: Path,
     checkpoint_dir: Path,
     task: str,
@@ -616,12 +629,26 @@ def make_sequence_scores(
     device: torch.device,
     batch_size: int,
     num_workers: int,
+    score_col: str,
+    numeric_min_count: int,
+    emb_dim: int,
+    hidden_dim: int,
+    dropout: float,
 ) -> pd.DataFrame:
     """
-    Загружает code-only sequence checkpoint и возвращает raw sigmoid scores
-    для tuning + held_out.
+    Inference for checkpoints trained by train_sequence_compression_model_clearml.py.
+
+    Works for:
+      - code-only sequence models, e.g. RETAIN_lite
+      - numeric sequence models, e.g. RETAIN_lite_numeric / GRU_2L_numeric
+
+    Important:
+      model_name is the checkpoint filename model name.
+      seq_base.make_model needs base_model_name + use_numeric.
     """
     set_global_seed(seed)
+
+    base_model_name, use_numeric = split_model_name_for_seq_base(model_name)
 
     ckpt_file = find_checkpoint(
         ckpt_dir=checkpoint_dir,
@@ -634,109 +661,75 @@ def make_sequence_scores(
     if not ckpt_file.exists():
         raise FileNotFoundError(f"Sequence checkpoint not found: {ckpt_file}")
 
-    print(f"Loading sequence checkpoint: {ckpt_file}")
+    print(f"Loading compression checkpoint: {ckpt_file}")
+    print(f"  file model_name={model_name}")
+    print(f"  seq_base model={base_model_name}")
+    print(f"  use_numeric={use_numeric}")
 
     ckpt = safe_torch_load(ckpt_file, device)
 
-    df = seq_mod.load_sequence_examples(sequence_data_dir, task, version)
-    vocab = seq_mod.load_vocab(sequence_data_dir, task, version)
+    df = seq_base.load_sequence_examples(sequence_data_dir, task, version)
+    vocab = seq_base.load_vocab(sequence_data_dir, task, version)
+    vocab_size = len(vocab)
 
     max_len = int(ckpt.get("max_len", 4096))
 
-    loaders = seq_mod.make_loaders(
-        df=df,
-        batch_size=batch_size,
-        max_len=max_len,
-        seed=seed,
-        num_workers=num_workers,
-    )
+    run_args = argparse.Namespace(
+        sequence_dir=sequence_data_dir,
+        sequence_data_s3_prefix="",
+        sequence_data_artifact_name="",
+        results_dir=Path("."),
 
-    model = seq_mod.make_model(model_name, vocab_size=len(vocab))
-    model.load_state_dict(ckpt["state_dict"])
-    model.to(device)
-    model.eval()
-
-    frames = []
-
-    for split_name in ["tuning", "held_out"]:
-        pred = seq_mod.run_inference(model, loaders[split_name], device)
-        p = seq_mod.sigmoid_np(pred["logits"])
-
-        frames.append(
-            pd.DataFrame(
-                {
-                    "task": task,
-                    "split": split_name,
-                    "seed": seed,
-                    "row_id": pred["row_id"].astype(int),
-                    "subject_id": pred["subject_id"].astype(int),
-                    "y_true": pred["y_true"].astype(int),
-                    "p_sequence": p.astype(float),
-                }
-            )
-        )
-
-    return pd.concat(frames, ignore_index=True)
-
-
-def make_numeric_sequence_scores(
-    sequence_data_dir: Path,
-    checkpoint_dir: Path,
-    task: str,
-    version: str,
-    model_name: str,
-    seed: int,
-    device: torch.device,
-    batch_size: int,
-    num_workers: int,
-) -> pd.DataFrame:
-    """
-    Загружает numeric-aware sequence checkpoint и возвращает raw sigmoid scores
-    для tuning + held_out.
-    """
-    set_global_seed(seed)
-
-    ckpt_file = find_checkpoint(
-        ckpt_dir=checkpoint_dir,
         task=task,
         version=version,
-        model_name=model_name,
+        model=base_model_name,
         seed=seed,
-    )
+        device=str(device),
+        use_numeric=use_numeric,
 
-    if not ckpt_file.exists():
-        raise FileNotFoundError(f"Numeric sequence checkpoint not found: {ckpt_file}")
-
-    print(f"Loading numeric sequence checkpoint: {ckpt_file}")
-
-    ckpt = safe_torch_load(ckpt_file, device)
-
-    df = numseq_mod.load_sequence_examples(sequence_data_dir, task, version)
-    vocab = numseq_mod.load_vocab(sequence_data_dir, task, version)
-
-    max_len = int(ckpt.get("max_len", 4096))
-
-    if "token_numeric_mean" in ckpt and "token_numeric_std" in ckpt:
-        token_mean = np.asarray(ckpt["token_numeric_mean"], dtype=np.float32)
-        token_std = np.asarray(ckpt["token_numeric_std"], dtype=np.float32)
-    else:
-        train_df = df[df["split"] == "train"].copy().reset_index(drop=True)
-        token_mean, token_std, _ = numseq_mod.compute_token_numeric_stats(
-            train_df,
-            vocab_size=len(vocab),
-        )
-
-    loaders = numseq_mod.make_loaders(
-        df=df,
-        token_mean=token_mean,
-        token_std=token_std,
-        batch_size=batch_size,
         max_len=max_len,
-        seed=seed,
+        batch_size=batch_size,
         num_workers=num_workers,
+
+        epochs=0,
+        patience=0,
+        lr=1e-3,
+        weight_decay=1e-4,
+        grad_clip=1.0,
+        emb_dim=emb_dim,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+
+        max_train_examples=0,
+        max_eval_examples=0,
+        numeric_min_count=numeric_min_count,
+        top_fracs=[0.05, 0.10, 0.20],
+        save_checkpoint=False,
+
+        clearml=False,
+        execute_remotely=False,
+        clearml_queue="",
+        clearml_task_name="",
+        clearml_project="",
+        clearml_output_uri="",
     )
 
-    model = numseq_mod.make_model(model_name, vocab_size=len(vocab))
+    df_train = df[df["split"] == "train"].copy()
+
+    token_mean, token_std, _ = seq_base.compute_token_numeric_stats(
+        df_train,
+        vocab_size=vocab_size,
+        min_count=numeric_min_count,
+    )
+
+    loaders, _ = seq_base.make_loaders(
+        df=df,
+        args=run_args,
+        mean=token_mean,
+        std=token_std,
+    )
+
+    model = seq_base.make_model(vocab_size, run_args)
     model.load_state_dict(ckpt["state_dict"])
     model.to(device)
     model.eval()
@@ -744,8 +737,8 @@ def make_numeric_sequence_scores(
     frames = []
 
     for split_name in ["tuning", "held_out"]:
-        pred = numseq_mod.run_inference(model, loaders[split_name], device)
-        p = numseq_mod.sigmoid_np(pred["logits"])
+        pred = seq_base.run_inference(model, loaders[split_name], device)
+        p = seq_base.sigmoid_np(pred["logits"])
 
         frames.append(
             pd.DataFrame(
@@ -756,13 +749,12 @@ def make_numeric_sequence_scores(
                     "row_id": pred["row_id"].astype(int),
                     "subject_id": pred["subject_id"].astype(int),
                     "y_true": pred["y_true"].astype(int),
-                    "p_numeric_sequence": p.astype(float),
+                    score_col: p.astype(float),
                 }
             )
         )
 
     return pd.concat(frames, ignore_index=True)
-
 
 def merge_base_scores(
     tabular: pd.DataFrame,
@@ -1062,6 +1054,13 @@ def sync_args_from_clearml_config(args, config: dict) -> None:
         "batch_size_sequence",
         "batch_size_numeric",
         "num_workers",
+        "emb_dim",
+        "hidden_dim",
+        "numeric_min_count",
+    }
+
+    float_keys = {
+        "dropout",
     }
 
     skip_keys = {"enable_clearml", "execute_remotely"}
@@ -1077,9 +1076,10 @@ def sync_args_from_clearml_config(args, config: dict) -> None:
             setattr(args, key, Path(value))
         elif key in int_keys:
             setattr(args, key, int(value))
+        elif key in float_keys:
+            setattr(args, key, float(value))
         else:
             setattr(args, key, value)
-
 
 def maybe_init_clearml(args, config: dict):
     remote_agent_run = is_clearml_agent_run()
@@ -1230,7 +1230,10 @@ def main():
     parser.add_argument("--batch-size-sequence", type=int, default=64)
     parser.add_argument("--batch-size-numeric", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
-
+    parser.add_argument("--emb-dim", type=int, default=64)
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--dropout", type=float, default=0.20)
+    parser.add_argument("--numeric-min-count", type=int, default=3)
     parser.add_argument(
         "--score-transform",
         type=str,
@@ -1348,7 +1351,7 @@ def main():
                 top_n_numeric_codes=args.top_n_numeric_codes,
             )
 
-            seq_scores = make_sequence_scores(
+            seq_scores = make_compression_sequence_scores(
                 sequence_data_dir=args.sequence_data_dir,
                 checkpoint_dir=args.sequence_checkpoint_dir,
                 task=task,
@@ -1358,9 +1361,14 @@ def main():
                 device=device,
                 batch_size=args.batch_size_sequence,
                 num_workers=args.num_workers,
+                score_col="p_sequence",
+                numeric_min_count=args.numeric_min_count,
+                emb_dim=args.emb_dim,
+                hidden_dim=args.hidden_dim,
+                dropout=args.dropout,
             )
 
-            numseq_scores = make_numeric_sequence_scores(
+            numseq_scores = make_compression_sequence_scores(
                 sequence_data_dir=args.sequence_data_dir,
                 checkpoint_dir=args.numeric_checkpoint_dir,
                 task=task,
@@ -1370,6 +1378,11 @@ def main():
                 device=device,
                 batch_size=args.batch_size_numeric,
                 num_workers=args.num_workers,
+                score_col="p_numeric_sequence",
+                numeric_min_count=args.numeric_min_count,
+                emb_dim=args.emb_dim,
+                hidden_dim=args.hidden_dim,
+                dropout=args.dropout,
             )
 
             merged = merge_base_scores(
