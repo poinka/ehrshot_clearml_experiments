@@ -36,23 +36,38 @@ META_COLS = {"task", "row_id", "subject_id", "prediction_time", "label", "split"
 BEST_TASK_CONFIGS = {
     "guo_readmission": {
         "tabular_model": "HistGradientBoosting",
+
+        # code-only companion model
         "sequence": {
-            "version": "compressed_dedup",
+            "version": "condition_era_180",
             "model": "RETAIN_lite",
         },
+
+        # новая лучшая модель:
+        # RETAIN_lite_numeric + raw
+        # AUPRC = 0.397 ± 0.015
+        # AUROC = 0.789 ± 0.008
         "numeric_sequence": {
-            "version": "compressed_dedup",
+            "version": "raw",
             "model": "RETAIN_lite_numeric",
         },
     },
+
     "guo_icu": {
         "tabular_model": "RandomForest_balanced",
+
+        # code-only companion model 
         "sequence": {
-            "version": "compressed_condition_era",
+            "version": "compressed_dedup",
             "model": "LSTM_1L",
         },
+
+        # новая лучшая модель:
+        # GRU_2L_numeric + condition_era_90
+        # AUPRC = 0.204 ± 0.044
+        # AUROC = 0.759 ± 0.041
         "numeric_sequence": {
-            "version": "compressed_hybrid",
+            "version": "condition_era_90",
             "model": "GRU_2L_numeric",
         },
     },
@@ -97,13 +112,30 @@ FUSION_SPECS = {
     "numeric_sequence_only": ["p_numeric_sequence"],
     "fusion_tabular_sequence": ["p_tabular", "p_sequence"],
     "fusion_tabular_numeric_sequence": ["p_tabular", "p_numeric_sequence"],
-    "fusion_tabular_sequence_numeric": [
-        "p_tabular",
-        "p_sequence",
-        "p_numeric_sequence",
-    ],
 }
 
+def get_required_local_copy(remote_url: str) -> Path:
+    from clearml import StorageManager
+
+    local_copy = StorageManager.get_local_copy(remote_url=remote_url)
+
+    if local_copy is None:
+        raise FileNotFoundError(
+            "ClearML StorageManager could not download object.\n"
+            f"Remote URL not found or not accessible:\n{remote_url}\n\n"
+            "Check that the MinIO prefix is correct and that the file exists."
+        )
+
+    path = Path(local_copy)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            "ClearML StorageManager returned a path, but it does not exist.\n"
+            f"Remote URL: {remote_url}\n"
+            f"Local path: {path}"
+        )
+
+    return path
 
 def get_device(device_arg: str) -> torch.device:
     if device_arg != "auto":
@@ -238,7 +270,7 @@ def maybe_download_tabular_cache_from_s3_prefix(
         remote_url = f"{prefix}/{fname}"
         print(f"Downloading {remote_url}")
 
-        local_copy = Path(StorageManager.get_local_copy(remote_url=remote_url))
+        local_copy = get_required_local_copy(remote_url)
 
         if not local_copy.exists():
             raise FileNotFoundError(f"StorageManager returned missing local file: {local_copy}")
@@ -346,7 +378,7 @@ def maybe_download_sequence_datasets_from_s3_prefix(
             remote_url = f"{prefix}/{task}/{version}/{fname}"
             print(f"Downloading {remote_url}")
 
-            local_copy = Path(StorageManager.get_local_copy(remote_url=remote_url))
+            local_copy = get_required_local_copy(remote_url)
 
             if not local_copy.exists():
                 raise FileNotFoundError(f"StorageManager returned missing local file: {local_copy}")
@@ -499,7 +531,7 @@ def maybe_download_checkpoints_from_s3_prefix(
 
             print(f"Downloading {remote_url}")
 
-            local_copy = Path(StorageManager.get_local_copy(remote_url=remote_url))
+            local_copy = get_required_local_copy(remote_url)
 
             if not local_copy.exists():
                 raise FileNotFoundError(f"StorageManager returned missing local file: {local_copy}")
