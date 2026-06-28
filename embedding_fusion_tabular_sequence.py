@@ -742,10 +742,40 @@ def fit_predict_embedding_fusion(
     class_weight: str | None,
     lr_c: float,
 ) -> np.ndarray:
-    x_train = train_df[feature_cols].to_numpy(dtype=np.float32)
+    x_train_df = train_df[feature_cols].copy()
+    x_eval_df = eval_df[feature_cols].copy()
+
+    # Drop columns that are entirely missing on train.
+    non_empty_cols = [
+        c for c in feature_cols
+        if x_train_df[c].notna().any()
+    ]
+
+    if len(non_empty_cols) < len(feature_cols):
+        dropped = len(feature_cols) - len(non_empty_cols)
+        print(f"WARNING: dropped {dropped} all-NaN feature columns before imputation")
+
+    # Drop constant columns too: they do not help LogisticRegression.
+    variable_cols = []
+    for c in non_empty_cols:
+        values = x_train_df[c].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if len(values) == 0:
+            continue
+        if np.nanstd(values) > 1e-12:
+            variable_cols.append(c)
+
+    if len(variable_cols) < len(non_empty_cols):
+        dropped = len(non_empty_cols) - len(variable_cols)
+        print(f"WARNING: dropped {dropped} constant feature columns")
+
+    if not variable_cols:
+        raise ValueError("No usable feature columns after filtering")
+
+    x_train = x_train_df[variable_cols].to_numpy(dtype=np.float32)
     y_train = train_df["y_true"].astype(int).to_numpy()
 
-    x_eval = eval_df[feature_cols].to_numpy(dtype=np.float32)
+    x_eval = x_eval_df[variable_cols].to_numpy(dtype=np.float32)
 
     model = make_meta_model(class_weight=class_weight, lr_c=lr_c)
     model.fit(x_train, y_train)
