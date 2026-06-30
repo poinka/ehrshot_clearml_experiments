@@ -49,7 +49,7 @@ from sklearn.linear_model import LogisticRegression
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.data import DataLoader, Dataset
 
-from common_ehrshot_eval import (
+from clearml_multiseed_scripts.reproducibility_package.code.common_ehrshot_eval import (
     binary_ranking_metrics,
     parse_int_list,
     set_global_seed,
@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-config",
         type=Path,
-        default=Path("../configs/sequence_final_runs.json"),
+        default=Path("configs/sequence_final_runs.json"),
         help="JSON-файл со списком финальных sequence запусков.",
     )
 
