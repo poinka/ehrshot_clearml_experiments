@@ -49,7 +49,7 @@ from sklearn.linear_model import LogisticRegression
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.data import DataLoader, Dataset
 
-from clearml_multiseed_scripts.reproducibility_package.code.common_ehrshot_eval import (
+from common_ehrshot_eval import (
     binary_ranking_metrics,
     parse_int_list,
     set_global_seed,
@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-config",
         type=Path,
-        default=Path("configs/sequence_final_runs.json"),
+        default=Path("reproducibility_package/configs/sequence_final_runs.json"),
         help="JSON-файл со списком финальных sequence запусков.",
     )
 
@@ -1909,22 +1909,20 @@ def is_clearml_agent_run() -> bool:
     )
 
 
-def build_clearml_config(
-    args: argparse.Namespace,
-    run_config: dict[str, Any],
-) -> dict[str, Any]:
+def build_clearml_config(args: argparse.Namespace) -> dict[str, Any]:
     """
     Готовит параметры для ClearML.
 
-    Path переводим в str, потому что ClearML может плохо сериализовать Path.
+    Важно:
+    run_config_json сюда не кладем, потому что на remote agent
+    сначала надо восстановить args.run_config из task params,
+    а уже потом читать JSON.
     """
     cfg = vars(args).copy()
 
     for key in ["run_config", "sequence_data_dir", "output_dir"]:
         if key in cfg:
             cfg[key] = str(cfg[key])
-
-    cfg["run_config_json"] = run_config
 
     return cfg
 
@@ -1997,22 +1995,10 @@ def sync_args_from_clearml_config(
             setattr(args, key, value)
 
 
-def maybe_init_clearml(
-    args: argparse.Namespace,
-    run_config: dict[str, Any],
-):
+def maybe_init_clearml(args: argparse.Namespace):
     """
-    Инициализирует ClearML.
-
-    Режимы:
-        1. Локально без ClearML:
-            --enable-clearml не указан, ничего не делаем.
-
-        2. Локально с постановкой в очередь:
-            --enable-clearml --execute-remotely
-
-        3. Уже внутри ClearML agent:
-            берем текущий task.
+    Инициализирует ClearML и синхронизирует параметры task -> args
+    до чтения run_config.
     """
     remote_agent_run = is_clearml_agent_run()
 
@@ -2042,12 +2028,7 @@ def maybe_init_clearml(
             auto_connect_arg_parser=False,
         )
 
-    connected_cfg = dict(
-        task.connect(
-            build_clearml_config(args, run_config),
-        )
-    )
-
+    connected_cfg = dict(task.connect(build_clearml_config(args)))
     sync_args_from_clearml_config(args, connected_cfg)
 
     print("Resolved ClearML parameters:")
@@ -2062,7 +2043,6 @@ def maybe_init_clearml(
 
     if args.execute_remotely and not remote_agent_run:
         print(f"Enqueueing ClearML task to queue: {args.clearml_queue}")
-
         task.execute_remotely(
             queue_name=args.clearml_queue,
             exit_process=True,
@@ -2078,13 +2058,22 @@ def maybe_init_clearml(
 def main() -> None:
     args = parse_args()
 
+    # Важно: сначала ClearML sync.
+    # На remote agent CLI-аргументы могут не прийти как sys.argv,
+    # но они должны восстановиться из task parameters.
+    clearml_task = maybe_init_clearml(args)
+    clearml_task_id = clearml_task.id if clearml_task is not None else None
+
+    # И только теперь читаем JSON.
     run_config = read_json(args.run_config)
+
     args.run_set = str(
         run_config.get(
             "run_set",
             "sequence_final_repro_time2vec_v1",
         )
     )
+
     run_cfgs = [
         normalize_run_cfg(raw_cfg)
         for raw_cfg in run_config.get("runs", [])
@@ -2094,9 +2083,6 @@ def main() -> None:
         raise ValueError("Run config contains no runs.")
 
     seeds = get_seeds(args, run_config)
-
-    clearml_task = maybe_init_clearml(args, run_config)
-    clearml_task_id = clearml_task.id if clearml_task is not None else None
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
