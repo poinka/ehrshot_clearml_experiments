@@ -313,6 +313,15 @@ def parse_args() -> argparse.Namespace:
     )
     
     parser.add_argument(
+        "--skip-checkpoint-upload",
+        action="store_true",
+        help=(
+            "Сохранять checkpoints локально, но не загружать их в MinIO/S3. "
+            "Полезно, если MinIO переполнен или временно не принимает upload."
+        ),
+    )
+    
+    parser.add_argument(
         "--checkpoint-s3-prefix",
         type=str,
         default=DEFAULT_CHECKPOINT_S3_PREFIX,
@@ -1947,10 +1956,15 @@ def run_one(
             seed=seed,
         )
 
-        checkpoint_s3_url = upload_file_to_minio(
-            local_path=ckpt_path,
-            remote_url=remote_ckpt_url,
-        )
+        if args.skip_checkpoint_upload:
+            checkpoint_s3_url = ""
+            print("Checkpoint upload skipped by --skip-checkpoint-upload.")
+            print(f"Local checkpoint saved at: {ckpt_path}")
+        else:
+            checkpoint_s3_url = upload_file_to_minio(
+                local_path=ckpt_path,
+                remote_url=remote_ckpt_url,
+            )
 
     config_row = build_config_row(
         run_cfg=run_cfg,
@@ -2014,6 +2028,14 @@ def build_clearml_config(args: argparse.Namespace) -> dict[str, Any]:
 
     return cfg
 
+def safe_upload_artifact(task, name: str, obj) -> None:
+    if task is None:
+        return
+
+    try:
+        task.upload_artifact(name, artifact_object=obj)
+    except Exception as e:
+        print(f"WARNING: failed to upload artifact {name}: {repr(e)}")
 
 def _to_bool(x: Any) -> bool:
     """
@@ -2056,6 +2078,8 @@ def sync_args_from_clearml_config(
     }
     bool_keys = {
         "no_save_checkpoints",
+        "skip_checkpoint_upload",
+        "resume",
     }
 
     skip_keys = {
@@ -2326,12 +2350,12 @@ def main() -> None:
     )
 
     if clearml_task is not None:
-        clearml_task.upload_artifact("sequence_multiseed_results", results_df)
-        clearml_task.upload_artifact("sequence_multiseed_predictions", predictions_df)
-        clearml_task.upload_artifact("sequence_multiseed_topk", topk_df)
-        clearml_task.upload_artifact("sequence_multiseed_history", history_df)
-        clearml_task.upload_artifact("sequence_token_numeric_stats", token_stats_df)
-        clearml_task.upload_artifact("sequence_multiseed_configs", configs_df)
+        safe_upload_artifact(clearml_task, "sequence_multiseed_results", results_df)
+        safe_upload_artifact(clearml_task, "sequence_multiseed_predictions", predictions_df)
+        safe_upload_artifact(clearml_task, "sequence_multiseed_topk", topk_df)
+        safe_upload_artifact(clearml_task, "sequence_multiseed_history", history_df)
+        safe_upload_artifact(clearml_task, "sequence_token_numeric_stats", token_stats_df)
+        safe_upload_artifact(clearml_task, "sequence_multiseed_configs", configs_df)                    
 
 
 if __name__ == "__main__":
