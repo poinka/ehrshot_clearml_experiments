@@ -2107,6 +2107,7 @@ def maybe_init_clearml(args: argparse.Namespace):
                 task_name=args.clearml_task_name,
                 output_uri=args.clearml_output_uri or None,
                 auto_connect_arg_parser=False,
+                auto_connect_frameworks=False,
             )
     else:
         task = Task.init(
@@ -2114,6 +2115,7 @@ def maybe_init_clearml(args: argparse.Namespace):
             task_name=args.clearml_task_name,
             output_uri=args.clearml_output_uri or None,
             auto_connect_arg_parser=False,
+            auto_connect_frameworks=False,
         )
 
     connected_cfg = dict(task.connect(build_clearml_config(args)))
