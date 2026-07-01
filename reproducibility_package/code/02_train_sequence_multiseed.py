@@ -105,9 +105,11 @@ def upload_file_to_minio(local_path: Path, remote_url: str) -> str:
     """
     Загружает локальный файл в MinIO/S3 через ClearML StorageManager.
 
-    Возвращает remote_url, чтобы потом сохранить его в configs.csv.
-
-    Если remote_url пустой, upload пропускается.
+    Важно:
+    upload не должен ронять весь training run.
+    MinIO периодически дает IncompleteBody / SSL EOF.
+    В таком случае возвращаем пустую строку, а локальный checkpoint_path
+    остается в configs.csv.
     """
     if not remote_url:
         return ""
@@ -121,13 +123,22 @@ def upload_file_to_minio(local_path: Path, remote_url: str) -> str:
 
     print(f"Uploading checkpoint: {local_path} -> {remote_url}")
 
-    StorageManager.upload_file(
-        local_file=str(local_path),
-        remote_url=remote_url,
-        wait_for_upload=True,
-    )
+    try:
+        StorageManager.upload_file(
+            local_file=str(local_path),
+            remote_url=remote_url,
+            wait_for_upload=True,
+        )
+        return remote_url
 
-    return remote_url
+    except Exception as e:
+        print("=" * 100)
+        print("WARNING: checkpoint upload failed, but training will continue.")
+        print(f"local_path = {local_path}")
+        print(f"remote_url = {remote_url}")
+        print(f"error = {repr(e)}")
+        print("=" * 100)
+        return ""
 
 # -----------------------------------------------------------------------------
 # 2. CLI
