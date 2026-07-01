@@ -100,6 +100,77 @@ def safe_path_part(value: object) -> str:
     """
     return str(value).replace("/", "__").replace(" ", "_")
 
+def minio_file_exists(remote_url: str) -> bool:
+    if not remote_url:
+        return False
+
+    try:
+        from clearml import StorageManager
+        local_copy = StorageManager.get_local_copy(remote_url=remote_url)
+        return local_copy is not None and Path(local_copy).exists()
+    except Exception as e:
+        print(f"WARNING: could not check remote checkpoint existence: {remote_url}")
+        print(f"error = {repr(e)}")
+        return False
+
+
+def build_local_checkpoint_path(
+    output_dir: Path,
+    run_set: str,
+    run_cfg: dict[str, Any],
+    seed: int,
+) -> Path:
+    ckpt_filename = "_".join(
+        [
+            safe_path_part(run_cfg["model_name"]),
+            safe_path_part(run_cfg["compression_version"]),
+            f"seed{int(seed)}",
+            "model.pt",
+        ]
+    )
+
+    return (
+        output_dir
+        / "checkpoints"
+        / safe_path_part(run_set)
+        / safe_path_part(run_cfg["task"])
+        / safe_path_part(run_cfg["model_family"])
+        / ckpt_filename
+    )
+
+
+def should_skip_run(
+    run_cfg: dict[str, Any],
+    seed: int,
+    args: argparse.Namespace,
+) -> bool:
+    if not getattr(args, "resume", False):
+        return False
+
+    local_ckpt = build_local_checkpoint_path(
+        output_dir=args.output_dir,
+        run_set=args.run_set,
+        run_cfg=run_cfg,
+        seed=seed,
+    )
+
+    if local_ckpt.exists():
+        print(f"RESUME: skipping existing local checkpoint: {local_ckpt}")
+        return True
+
+    remote_ckpt_url = build_sequence_checkpoint_remote_url(
+        checkpoint_s3_prefix=args.checkpoint_s3_prefix,
+        run_set=args.run_set,
+        run_cfg=run_cfg,
+        seed=seed,
+    )
+
+    if minio_file_exists(remote_ckpt_url):
+        print(f"RESUME: skipping existing remote checkpoint: {remote_ckpt_url}")
+        return True
+
+    return False
+
 
 def upload_file_to_minio(local_path: Path, remote_url: str) -> str:
     """
@@ -235,6 +306,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Пропускать run, если checkpoint уже существует локально или в MinIO.",
+    )
+    
     parser.add_argument(
         "--checkpoint-s3-prefix",
         type=str,
@@ -2136,6 +2213,8 @@ def main() -> None:
                 f"numeric_on={run_cfg['numeric_on']} | "
                 f"seed={seed}"
             )
+            if should_skip_run(run_cfg, seed, args):
+                continue
 
             (
                 result_df,
