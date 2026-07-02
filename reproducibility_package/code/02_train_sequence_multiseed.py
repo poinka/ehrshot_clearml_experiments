@@ -2282,10 +2282,10 @@ def main() -> None:
                 args.output_dir / "sequence_multiseed_history.csv",
                 index=False,
             )
-            pd.concat(all_token_stats, ignore_index=True).to_csv(
-                args.output_dir / "sequence_token_numeric_stats.csv",
-                index=False,
-            )
+            # pd.concat(all_token_stats, ignore_index=True).to_csv(
+            #     args.output_dir / "sequence_token_numeric_stats.csv",
+            #     index=False,
+            # )
             pd.DataFrame(all_configs).to_csv(
                 args.output_dir / "sequence_multiseed_configs.csv",
                 index=False,
@@ -2295,7 +2295,7 @@ def main() -> None:
     predictions_df = pd.concat(all_predictions, ignore_index=True)
     topk_df = pd.concat(all_topk, ignore_index=True)
     history_df = pd.concat(all_history, ignore_index=True)
-    token_stats_df = pd.concat(all_token_stats, ignore_index=True)
+    # token_stats_df = pd.concat(all_token_stats, ignore_index=True)
     configs_df = pd.DataFrame(all_configs)
 
     results_path = args.output_dir / "sequence_multiseed_results.csv"
@@ -2309,7 +2309,7 @@ def main() -> None:
     predictions_df.to_csv(predictions_path, index=False)
     topk_df.to_csv(topk_path, index=False)
     history_df.to_csv(history_path, index=False)
-    token_stats_df.to_csv(token_stats_path, index=False)
+    # token_stats_df.to_csv(token_stats_path, index=False)
     configs_df.to_csv(configs_path, index=False)
 
     print("=" * 100)
@@ -2354,7 +2354,7 @@ def main() -> None:
         safe_upload_artifact(clearml_task, "sequence_multiseed_predictions", predictions_df)
         safe_upload_artifact(clearml_task, "sequence_multiseed_topk", topk_df)
         safe_upload_artifact(clearml_task, "sequence_multiseed_history", history_df)
-        safe_upload_artifact(clearml_task, "sequence_token_numeric_stats", token_stats_df)
+        # safe_upload_artifact(clearml_task, "sequence_token_numeric_stats", token_stats_df)
         safe_upload_artifact(clearml_task, "sequence_multiseed_configs", configs_df)                    
 
 
